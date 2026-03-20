@@ -2,6 +2,12 @@
 config/settings.cfm
 secrets.cfm
 
+# Lucee generated web context — do not commit
+WEB-INF/
+
+# Default redirect — site-specific, not part of the app
+default.cfm
+
 # OS cruft
 .DS_Store
 Thumbs.db
