@@ -53,7 +53,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sign In — DMARC Dashboard</title>
+    <!--- Title reads from application.appName set in config/settings.cfm --->
+    <title>Sign In — <cfoutput>#htmlEditFormat(application.appName)#</cfoutput></title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
@@ -89,8 +90,9 @@
 <body>
 <div class="login-wrap">
     <div class="login-brand">
-        <div class="mono">whizardries.com</div>
-        <h1>DMARC Dashboard</h1>
+        <!--- Brand reads from application.appName set in config/settings.cfm --->
+        <div class="mono"><cfoutput>#htmlEditFormat(application.appName)#</cfoutput></div>
+        <h1>Sign In</h1>
     </div>
     <div class="login-card">
         <cfif len(variables.error)>
@@ -112,7 +114,7 @@
         </form>
         </cfoutput>
     </div>
-    <div class="login-footer">DMARC Dashboard &mdash; Administrative Access</div>
+    <div class="login-footer">Administrative Access</div>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/js/bootstrap.bundle.min.js"></script>
 </body>

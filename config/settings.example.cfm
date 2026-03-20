@@ -7,12 +7,12 @@
     // Database
     // ----------------------------------------------------------------
     application.db = {
-        host     : "gandalf.whizardries.com",
+        host     : "db.example.com",       // your MariaDB hostname
         port     : 3306,
         name     : "dmarc",
         username : "dmarc_app",
         password : "CHANGE_ME",
-        dsn      : "dmarc"        // Lucee datasource name — configure in Lucee admin
+        dsn      : "dmarc"                 // Lucee datasource name — configure in Lucee admin
     };
 
     // ----------------------------------------------------------------
@@ -35,16 +35,17 @@
     // ----------------------------------------------------------------
     // Application
     // ----------------------------------------------------------------
-    application.appName    = "DMARC Dashboard";
+    application.appName    = "DMARC Dashboard";   // displayed in sidebar and login page
     application.appVersion = "1.0.0";
-    application.baseURL    = "https://dmarc.whizardries.com";
-    application.adminEmail = "admin@whizardries.com";
+    application.baseURL    = "https://dmarc.example.com";   // no trailing slash
+    application.adminEmail = "admin@example.com";
 
     // ----------------------------------------------------------------
     // Google OAuth2 (for Gmail IMAP accounts)
     // ----------------------------------------------------------------
-    // Create at https://console.cloud.google.com
-    // These are defaults — can be overridden per imap_account row.
+    // Create credentials at https://console.cloud.google.com
+    // Enable the Gmail API and add an OAuth2 client (Web application type).
+    // Add your baseURL & "/admin/oauth_callback.cfm" as an authorised redirect URI.
     application.googleOAuth = {
         clientId     : "CHANGE_ME.apps.googleusercontent.com",
         clientSecret : "CHANGE_ME",
