@@ -1,11 +1,10 @@
 <!--- Application.cfc --->
 <cfcomponent output="false">
 
-    <cfset this.name                 = "DMARCDashboard">
-    <cfset this.sessionManagement   = true>
-    <cfset this.sessionTimeout      = createTimeSpan(0, 8, 0, 0)>
-    <cfset this.setClientCookies    = false>
-    <cfset this.scriptProtect       = "all">
+    <cfset this.name               = "DMARCDashboard">
+    <cfset this.sessionManagement  = true>
+    <cfset this.sessionTimeout     = createTimeSpan(0, 8, 0, 0)>
+    <cfset this.scriptProtect      = "all">
 
     <!--- Datasource — must match Lucee admin config --->
     <cfset this.datasource = "dmarc">
@@ -16,9 +15,9 @@
     </cffunction>
 
     <cffunction name="onSessionStart" returntype="void" output="false">
-        <cfset session.loggedIn    = false>
-        <cfset session.userId      = "">
-        <cfset session.username    = "">
+        <cfset session.loggedIn     = false>
+        <cfset session.userId       = "">
+        <cfset session.username     = "">
         <cfset session.sessionToken = "">
     </cffunction>
 
