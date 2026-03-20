@@ -1,16 +1,41 @@
-# DMARC
-ColdFusion scripting to populate a database with DMARC reporting information and display data.
+# cfDMARC
 
-# Back work
-Use fetchmail to retrieve messages. CFIMAP does not actually seem to retrieve file attachments. Since I don't get that many reports, I set the polling interval to 14400 seconds (every 4 hours). Don't forget to set the correct IMAP folder if you're also collecting abuse reports in that mailbox.
+A ColdFusion/Lucee DMARC reporting dashboard for self-hosted infrastructure.
 
-There is a secondary bash script named "getxml.sh" which will extract the XML messages. (The script was mainly taken from https://gist.github.com/iiikhsan/6aecaa866ed4aa4ed621.) It currently only checks for .zip and .gz archives as those are the only two types that I've gotten in several years of report collecting. This script assumes that new messages are being placed in ~/Maildir/new (fetchmail hands the messages off to procmail for local delivery). It also assumes the existence of the following directories:
+## Features
 
-~/Maildir/process
-~/Maildir/process/archive
-~/Maildir/process/extract
-~/Maildir/process/landing
-~/Maildir/process/store
+- IMAP polling (password auth + Google OAuth2) for automated report ingestion
+- Parses RUA (aggregate) and RUF (forensic) DMARC reports
+- MariaDB backend — schema supports multiple domains automatically
+- Dark dashboard UI with ApexCharts visualizations
+- Time-limited share tokens for read-only public views
+- Full audit logging
 
-# License
-This project is licensed under the GNU Affero General Public License - see the [LICENSE](https://github.com/MickLC/DMARC/blob/master/LICENSE) file for details
+## Requirements
+
+- Lucee 5.x or Adobe ColdFusion 2018+
+- MariaDB 10.5+ (tested on 11.4)
+- Apache/Nginx vhost
+
+## Setup
+
+1. Clone repo to web root: `git clone https://github.com/MickLC/cfDMARC /var/www/dmarc`
+2. Copy config: `cp config/settings.example.cfm config/settings.cfm`
+3. Edit `config/settings.cfm` with your DB credentials and keys
+4. Configure a Lucee datasource named `dmarc` pointing at your MariaDB instance
+5. Run `db/001_migrate_schema.sql` against your database
+6. Browse to `/admin/setup.cfm` to create the first admin user
+7. **Delete `admin/setup.cfm`** after setup
+8. Configure a `cfschedule` task pointing at `/poller/poll.cfm`
+
+## Security Notes
+
+- `config/settings.cfm` is gitignored — never commit it
+- Generate pepper and encryption key with `openssl rand -base64 32`
+- Set `DMARC_PEPPER` as an environment variable rather than in settings.cfm
+- Delete `admin/setup.cfm` immediately after creating your admin account
+
+## Legacy
+
+The `legacy/` directory contains the original 2016 shell-script-based pipeline
+(procmail → munpack → ColdFusion XML processor). Preserved for reference only.

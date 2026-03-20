@@ -1,0 +1,7 @@
+# LEGACY FILE — preserved for historical reference only.
+# This procmail rule routed DMARC report emails to a Maildir for getxml.sh.
+# Superseded by the IMAP poller in the current application.
+#
+:0
+* ^Subject:.*Report domain:
+/home/fetch/Maildir/new/
