@@ -4,29 +4,48 @@
 <cfscript>
 
 // ----------------------------------------------------------------
-// Password hashing via BCrypt (work factor 12)
-// BCrypt is available in Lucee via the bundled Spring Security crypto jar.
-// The pepper is prepended before hashing for defence in depth.
+// Password hashing via GeneratePBKDFKey (PBKDF2WithHmacSHA256)
+// Matches the approach used in cfblocklist which is proven to work.
+// Hash format: iterations:salt:derived
 // ----------------------------------------------------------------
 
 function hashPassword(required string plaintext) {
     var pepper = structKeyExists(application, "pepper")
                  ? application.pepper
                  : environmentGet("DMARC_PEPPER", "");
-    var salted = pepper & arguments.plaintext;
-    var encoder = createObject("java", "org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder")
-                    .init(javaCast("int", 12));
-    return encoder.encode(javaCast("string", salted));
+    var salt       = generateSecretKey("AES", "256");
+    var iterations = randRange(50000, 100000, "SHA1PRNG");
+    var derived    = generatePBKDFKey(
+        "PBKDF2WithHmacSHA256",
+        arguments.plaintext,
+        salt & pepper,
+        iterations,
+        256
+    );
+    return iterations & ":" & salt & ":" & derived;
 }
 
 function verifyPassword(required string plaintext, required string storedHash) {
     var pepper = structKeyExists(application, "pepper")
                  ? application.pepper
                  : environmentGet("DMARC_PEPPER", "");
-    var salted = pepper & arguments.plaintext;
-    var encoder = createObject("java", "org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder")
-                    .init(javaCast("int", 12));
-    return encoder.matches(javaCast("string", salted), javaCast("string", arguments.storedHash));
+    var parts      = listToArray(arguments.storedHash, ":");
+    var iterations = val(parts[1]);
+    var salt       = parts[2];
+    var expected   = parts[3];
+    var derived    = generatePBKDFKey(
+        "PBKDF2WithHmacSHA256",
+        arguments.plaintext,
+        salt & pepper,
+        iterations,
+        256
+    );
+    // Constant-time comparison to prevent timing attacks
+    var jMD = createObject("java", "java.security.MessageDigest");
+    return jMD.isEqual(
+        derived.getBytes("UTF-8"),
+        expected.getBytes("UTF-8")
+    );
 }
 
 // ----------------------------------------------------------------
