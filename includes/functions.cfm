@@ -3,17 +3,35 @@
 --->
 <cfscript>
 
+// ----------------------------------------------------------------
+// Password hashing via BCrypt (work factor 12)
+// BCrypt is available in Lucee via the bundled Spring Security crypto jar.
+// The pepper is prepended before hashing for defence in depth.
+// ----------------------------------------------------------------
+
 function hashPassword(required string plaintext) {
     var pepper = structKeyExists(application, "pepper")
                  ? application.pepper
                  : environmentGet("DMARC_PEPPER", "");
     var salted = pepper & arguments.plaintext;
-    return hash(salted, "PBKDF2WithHmacSHA256", "UTF-8", 310000);
+    var encoder = createObject("java", "org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder")
+                    .init(javaCast("int", 12));
+    return encoder.encode(javaCast("string", salted));
 }
 
 function verifyPassword(required string plaintext, required string storedHash) {
-    return (hashPassword(arguments.plaintext) EQ arguments.storedHash);
+    var pepper = structKeyExists(application, "pepper")
+                 ? application.pepper
+                 : environmentGet("DMARC_PEPPER", "");
+    var salted = pepper & arguments.plaintext;
+    var encoder = createObject("java", "org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder")
+                    .init(javaCast("int", 12));
+    return encoder.matches(javaCast("string", salted), javaCast("string", arguments.storedHash));
 }
+
+// ----------------------------------------------------------------
+// Encryption for stored credentials (IMAP passwords, OAuth tokens)
+// ----------------------------------------------------------------
 
 function encryptValue(required string plaintext) {
     if (NOT len(trim(arguments.plaintext))) return "";
@@ -30,6 +48,10 @@ function decryptValue(required string ciphertext) {
     }
 }
 
+// ----------------------------------------------------------------
+// Session token generation
+// ----------------------------------------------------------------
+
 function generateToken(numeric length=64) {
     return lCase(toBase64(generateSecretKey("AES", arguments.length * 4)))
            .replaceAll("[^a-z0-9]", "")
@@ -39,6 +61,10 @@ function generateToken(numeric length=64) {
 function hashToken(required string token) {
     return lCase(hash(arguments.token, "SHA-256"));
 }
+
+// ----------------------------------------------------------------
+// Audit logging
+// ----------------------------------------------------------------
 
 function auditLog(
     required string action,
@@ -59,6 +85,10 @@ function auditLog(
         ]
     );
 }
+
+// ----------------------------------------------------------------
+// IP address helpers
+// ----------------------------------------------------------------
 
 function intToIPv4(required numeric ipInt) {
     var n = arguments.ipInt;
@@ -83,6 +113,10 @@ function formatSourceIP(numeric ip=0, string ip6="") {
     if (arguments.ip GT 0) return intToIPv4(arguments.ip);
     return "unknown";
 }
+
+// ----------------------------------------------------------------
+// Formatting helpers
+// ----------------------------------------------------------------
 
 function formatNumber(required numeric n) {
     return numberFormat(arguments.n, "_,___");
