@@ -38,119 +38,117 @@
         <cfreturn true>
     </cffunction>
 
-    <cffunction name="onError" returntype="void" output="true">
+    <!---
+        output="false" is REQUIRED here.
+        With output="true" Lucee parses # everywhere in the function body —
+        including inside <style> blocks — whether or not they are inside
+        <cfoutput> tags.  Using output="false" + writeOutput() lets us
+        write literal CSS hex colors without escaping them as ##.
+    --->
+    <cffunction name="onError" returntype="void" output="false">
         <cfargument name="exception" required="true">
         <cfargument name="eventName" type="string" required="true">
 
-        <!--- Always log the full detail server-side --->
+        <!--- Always log full detail server-side --->
         <cflog file="dmarc_errors"
                text="Error in #arguments.eventName#: #arguments.exception.message# | #arguments.exception.detail# | #arguments.exception.stackTrace#"
                type="error">
 
-        <cfset isAdmin = structKeyExists(session, "loggedIn") AND session.loggedIn>
+        <cfset local.isAdmin = structKeyExists(session, "loggedIn") AND session.loggedIn>
 
         <!--- Classify the error to give a useful hint --->
-        <cfset hint = "">
+        <cfset local.hint = "">
         <cfif findNoCase("Unknown column", arguments.exception.message)
            OR findNoCase("doesn't exist", arguments.exception.message)
            OR (findNoCase("Table", arguments.exception.message) AND findNoCase("exist", arguments.exception.message))>
-            <cfset hint = "This looks like a missing database table or column. Have you run all migrations? (<code>db/migrations/004_poller_tables.sql</code>)">
+            <cfset local.hint = "This looks like a missing database table or column. Have you run all migrations? (<code>db/migrations/004_poller_tables.sql</code>)">
         <cfelseif findNoCase("Access denied", arguments.exception.message)>
-            <cfset hint = "Database access denied. Check the credentials in <code>config/settings.cfm</code> and the MariaDB grant.">
+            <cfset local.hint = "Database access denied. Check the credentials in <code>config/settings.cfm</code> and the MariaDB grant.">
         <cfelseif findNoCase("datasource", arguments.exception.message)
                OR findNoCase("No datasource", arguments.exception.message)>
-            <cfset hint = "Lucee datasource not found. Verify the <code>dmarc</code> datasource is configured in the Lucee Web Admin.">
+            <cfset local.hint = "Lucee datasource not found. Verify the <code>dmarc</code> datasource is configured in the Lucee Web Admin.">
         <cfelseif findNoCase("decrypt", arguments.exception.message)
                OR findNoCase("encryptionKey", arguments.exception.message)>
-            <cfset hint = "Encryption/decryption error. Check that <code>application.encryptionKey</code> is set correctly in <code>config/settings.cfm</code>.">
+            <cfset local.hint = "Encryption/decryption error. Check that <code>application.encryptionKey</code> is set correctly in <code>config/settings.cfm</code>.">
         </cfif>
 
-        <!--- Style block is intentionally OUTSIDE cfoutput to avoid # in hex colors
-              being parsed as CFML expression delimiters --->
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <title>Error &mdash; DMARC Dashboard</title>
-            <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/css/bootstrap.min.css" rel="stylesheet">
-            <style>
-                body      { background: #0d1117; color: #e6edf3; font-family: 'IBM Plex Sans', sans-serif; padding: 2rem; }
-                .err-card { background: #1c2128; border: 1px solid #30363d; border-radius: 6px; padding: 1.5rem; max-width: 900px; margin: 2rem auto; }
-                .err-card h2  { color: #f85149; font-size: 1.1rem; margin-bottom: 1rem; }
-                .err-label    { font-size: 0.7rem; text-transform: uppercase; letter-spacing: .08em; color: #6e7681; font-family: 'IBM Plex Mono', monospace; margin-bottom: .25rem; }
-                .err-value    { background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: .6rem .9rem; font-family: 'IBM Plex Mono', monospace; font-size: .82rem; white-space: pre-wrap; word-break: break-all; color: #e6edf3; }
-                .err-hint     { background: rgba(56,139,253,.1); border: 1px solid rgba(56,139,253,.3); border-radius: 4px; padding: .75rem 1rem; font-size: .85rem; color: #79c0ff; margin-bottom: 1rem; }
-                .btn-back     { border: 1px solid #30363d; color: #8b949e; background: transparent; border-radius: 4px; padding: .3rem .75rem; font-size: .85rem; text-decoration: none; }
-                .btn-back:hover { background: #1c2128; color: #e6edf3; }
-                a             { color: #388bfd; }
-            </style>
-        </head>
-        <body>
-        <div class="err-card">
+        <!--- Static shell — no CFML expressions, so hex colors are safe --->
+        <cfset writeOutput('<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Error &mdash; DMARC Dashboard</title>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/css/bootstrap.min.css" rel="stylesheet">
+<style>
+body      { background: #0d1117; color: #e6edf3; font-family: sans-serif; padding: 2rem; }
+.err-card { background: #1c2128; border: 1px solid #30363d; border-radius: 6px; padding: 1.5rem; max-width: 900px; margin: 2rem auto; }
+.err-card h2 { color: #f85149; font-size: 1.1rem; margin-bottom: 1rem; }
+.err-label   { font-size: 0.7rem; text-transform: uppercase; letter-spacing: .08em; color: #6e7681; font-family: monospace; margin-bottom: .25rem; }
+.err-value   { background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: .6rem .9rem; font-family: monospace; font-size: .82rem; white-space: pre-wrap; word-break: break-all; color: #e6edf3; max-height: 300px; overflow-y: auto; }
+.err-hint    { background: rgba(56,139,253,.1); border: 1px solid rgba(56,139,253,.3); border-radius: 4px; padding: .75rem 1rem; font-size: .85rem; color: #79c0ff; margin-bottom: 1rem; }
+.btn-back    { border: 1px solid #30363d; color: #8b949e; background: transparent; border-radius: 4px; padding: .3rem .75rem; font-size: .85rem; text-decoration: none; display: inline-block; margin-right: .5rem; }
+a { color: #388bfd; }
+</style>
+</head>
+<body>
+<div class="err-card">
+<h2>&#9888; An error occurred</h2>')>
 
-        <cfoutput>
-            <h2>&#9888; An error occurred</h2>
+        <!--- Hint --->
+        <cfif len(local.hint)>
+            <cfset writeOutput('<div class="err-hint">' & local.hint & '</div>')>
+        </cfif>
 
-            <cfif len(hint)>
-            <div class="err-hint">#hint#</div>
-            </cfif>
+        <cfif local.isAdmin>
 
-            <cfif isAdmin>
+            <!--- Event --->
+            <cfset writeOutput('<div class="mb-3"><div class="err-label">Event</div><div class="err-value">'
+                & htmlEditFormat(arguments.eventName)
+                & '</div></div>')>
 
-            <div class="mb-3">
-                <div class="err-label">Event</div>
-                <div class="err-value">#htmlEditFormat(arguments.eventName)#</div>
-            </div>
+            <!--- Message --->
+            <cfset writeOutput('<div class="mb-3"><div class="err-label">Message</div><div class="err-value">'
+                & htmlEditFormat(arguments.exception.message)
+                & '</div></div>')>
 
-            <div class="mb-3">
-                <div class="err-label">Message</div>
-                <div class="err-value">#htmlEditFormat(arguments.exception.message)#</div>
-            </div>
-
+            <!--- Detail --->
             <cfif len(trim(arguments.exception.detail))>
-            <div class="mb-3">
-                <div class="err-label">Detail</div>
-                <div class="err-value">#htmlEditFormat(arguments.exception.detail)#</div>
-            </div>
+                <cfset writeOutput('<div class="mb-3"><div class="err-label">Detail</div><div class="err-value">'
+                    & htmlEditFormat(arguments.exception.detail)
+                    & '</div></div>')>
             </cfif>
 
+            <!--- QueryError --->
             <cfif structKeyExists(arguments.exception, "queryError") AND len(trim(arguments.exception.queryError))>
-            <div class="mb-3">
-                <div class="err-label">Query Error</div>
-                <div class="err-value">#htmlEditFormat(arguments.exception.queryError)#</div>
-            </div>
+                <cfset writeOutput('<div class="mb-3"><div class="err-label">Query Error</div><div class="err-value">'
+                    & htmlEditFormat(arguments.exception.queryError)
+                    & '</div></div>')>
             </cfif>
 
+            <!--- SQL --->
             <cfif structKeyExists(arguments.exception, "sql") AND len(trim(arguments.exception.sql))>
-            <div class="mb-3">
-                <div class="err-label">SQL</div>
-                <div class="err-value">#htmlEditFormat(arguments.exception.sql)#</div>
-            </div>
+                <cfset writeOutput('<div class="mb-3"><div class="err-label">SQL</div><div class="err-value">'
+                    & htmlEditFormat(arguments.exception.sql)
+                    & '</div></div>')>
             </cfif>
 
+            <!--- Stack trace --->
             <cfif structKeyExists(arguments.exception, "stackTrace") AND len(trim(arguments.exception.stackTrace))>
-            <div class="mb-3">
-                <div class="err-label">Stack Trace</div>
-                <div class="err-value" style="max-height:300px;overflow-y:auto;font-size:.75rem;">#htmlEditFormat(arguments.exception.stackTrace)#</div>
-            </div>
+                <cfset writeOutput('<div class="mb-3"><div class="err-label">Stack Trace</div><div class="err-value">'
+                    & htmlEditFormat(arguments.exception.stackTrace)
+                    & '</div></div>')>
             </cfif>
 
-            <cfelse>
-                <p style="color:#8b949e;">The error has been logged.
-                   <a href="/admin/login.cfm">Sign in</a>
-                   to see the full error details.</p>
-            </cfif>
+        <cfelse>
+            <cfset writeOutput('<p style="color:#8b949e;">The error has been logged.
+                <a href="/admin/login.cfm">Sign in</a> to see full details.</p>')>
+        </cfif>
 
-            <div class="mt-3">
-                <a href="javascript:history.back()" class="btn-back">&#8592; Back</a>
-                &nbsp;
-                <a href="/admin/dashboard.cfm" class="btn-back">Dashboard</a>
-            </div>
-        </cfoutput>
-
-        </div>
-        </body>
-        </html>
+        <!--- Nav buttons --->
+        <cfset writeOutput('<div class="mt-3">
+            <a href="javascript:history.back()" class="btn-back">&#8592; Back</a>
+            <a href="/admin/dashboard.cfm" class="btn-back">Dashboard</a>
+            </div></div></body></html>')>
 
     </cffunction>
 
