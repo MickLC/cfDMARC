@@ -87,20 +87,30 @@ function hashToken(required string token) {
 
 function auditLog(
     required string action,
-    string detail   = "",
+    string  detail  = "",
     numeric userId  = 0
 ) {
-    var uid = arguments.userId GT 0
-              ? arguments.userId
-              : (structKeyExists(session, "userId") ? session.userId : javaCast("null", ""));
-    var ip = CGI.REMOTE_ADDR ?: "unknown";
+    // Resolve user ID — prefer explicit argument, then session, then NULL
+    var hasUid = false;
+    var uid    = 0;
+
+    if (arguments.userId GT 0) {
+        hasUid = true;
+        uid    = arguments.userId;
+    } else if (structKeyExists(session, "userId") AND isNumeric(session.userId) AND session.userId GT 0) {
+        hasUid = true;
+        uid    = session.userId;
+    }
+
+    var ip = len(CGI.REMOTE_ADDR) ? CGI.REMOTE_ADDR : "unknown";
+
     queryExecute(
         "INSERT INTO audit_log (user_id, action, detail, ip_address) VALUES (?, ?, ?, ?)",
         [
-            { value: isNull(uid) ? javaCast("null","") : uid, null: isNull(uid) },
-            arguments.action,
-            left(arguments.detail, 512),
-            left(ip, 45)
+            { value: uid,                         cfsqltype: "cf_sql_integer", null: NOT hasUid },
+            { value: arguments.action,            cfsqltype: "cf_sql_varchar" },
+            { value: left(arguments.detail, 512), cfsqltype: "cf_sql_varchar" },
+            { value: left(ip, 45),                cfsqltype: "cf_sql_varchar" }
         ]
     );
 }
