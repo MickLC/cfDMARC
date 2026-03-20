@@ -1,41 +1,38 @@
-# cfDMARC
+# cfDMARC — Legacy Branch
 
-A ColdFusion/Lucee DMARC reporting dashboard for self-hosted infrastructure.
+This branch is a reference marker. It was created from `master` at the point
+the current application skeleton was first committed (March 2026).
 
-## Features
+## Original 2016 Pipeline Files
 
-- IMAP polling (password auth + Google OAuth2) for automated report ingestion
-- Parses RUA (aggregate) and RUF (forensic) DMARC reports
-- MariaDB backend — schema supports multiple domains automatically
-- Dark dashboard UI with ApexCharts visualizations
-- Time-limited share tokens for read-only public views
-- Full audit logging
+The original shell-script-based pipeline files are preserved in git history
+on the `master` branch at commit `cc6eeb8`:
 
-## Requirements
+- `legacy/processxml.cfm` — ColdFusion XML processor (read XML from `/tmp`,
+  output raw SQL to screen)
+- `legacy/getxml.sh` — Bash script using `munpack` to extract attachments
+  from a Maildir
+- `legacy/procmailrc` — Procmail rule routing DMARC report emails to the
+  Maildir
 
-- Lucee 5.x or Adobe ColdFusion 2018+
-- MariaDB 10.5+ (tested on 11.4)
-- Apache/Nginx vhost
+To view them:
+```bash
+git show cc6eeb8:legacy/processxml.cfm
+git show cc6eeb8:legacy/getxml.sh
+git show cc6eeb8:legacy/procmailrc
+```
 
-## Setup
+## Architecture Then vs Now
 
-1. Clone repo to web root: `git clone https://github.com/MickLC/cfDMARC /var/www/dmarc`
-2. Copy config: `cp config/settings.example.cfm config/settings.cfm`
-3. Edit `config/settings.cfm` with your DB credentials and keys
-4. Configure a Lucee datasource named `dmarc` pointing at your MariaDB instance
-5. Run `db/001_migrate_schema.sql` against your database
-6. Browse to `/admin/setup.cfm` to create the first admin user
-7. **Delete `admin/setup.cfm`** after setup
-8. Configure a `cfschedule` task pointing at `/poller/poll.cfm`
+```
+[2016]
+Email → procmail → Maildir → getxml.sh → /tmp/*.xml → processxml.cfm → SQL output (manual)
 
-## Security Notes
+[Current]
+Email → IMAP → poll.cfm → parse_rua.cfm → MariaDB → Dashboard
+```
 
-- `config/settings.cfm` is gitignored — never commit it
-- Generate pepper and encryption key with `openssl rand -base64 32`
-- Set `DMARC_PEPPER` as an environment variable rather than in settings.cfm
-- Delete `admin/setup.cfm` immediately after creating your admin account
+## Active Development
 
-## Legacy
-
-The `legacy/` directory contains the original 2016 shell-script-based pipeline
-(procmail → munpack → ColdFusion XML processor). Preserved for reference only.
+See the `develop` branch for current work.
+See `master` for stable releases.
