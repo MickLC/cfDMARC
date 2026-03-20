@@ -1,8 +1,7 @@
 <!--- poller/poll.cfm
       DMARC report poller entry point for cfschedule.
       Localhost access only.
---->
-<cfinclude template="/includes/functions.cfm">
+--->\n<cfinclude template="/includes/functions.cfm">
 
 <cfscript>
     if (cgi.remote_addr NEQ "127.0.0.1" AND cgi.remote_addr NEQ "::1") {
@@ -113,25 +112,26 @@
 
             if (acct.auth_type EQ "oauth2") {
 
+                // OAuth2: use JavaMail directly with XOAUTH2 SASL mechanism
                 xoauth2Raw   = "user=#acct.username#" & chr(1) & "auth=Bearer #imapPassword#" & chr(1) & chr(1);
                 xoauth2Token = toBase64(xoauth2Raw);
 
                 props = createObject("java","java.util.Properties").init();
-                props.setProperty("mail.store.protocol",         "imaps");
-                props.setProperty("mail.imaps.host",             acct.host);
-                props.setProperty("mail.imaps.port",             javaCast("string",acct.port));
-                props.setProperty("mail.imaps.ssl.enable",       "true");
-                props.setProperty("mail.imaps.auth.mechanisms",  "XOAUTH2");
-                props.setProperty("mail.imaps.sasl.enable",      "true");
-                props.setProperty("mail.imaps.sasl.mechanisms",  "XOAUTH2");
+                props.setProperty("mail.store.protocol",        "imaps");
+                props.setProperty("mail.imaps.host",            acct.host);
+                props.setProperty("mail.imaps.port",            javaCast("string",acct.port));
+                props.setProperty("mail.imaps.ssl.enable",      "true");
+                props.setProperty("mail.imaps.auth.mechanisms", "XOAUTH2");
+                props.setProperty("mail.imaps.sasl.enable",     "true");
+                props.setProperty("mail.imaps.sasl.mechanisms", "XOAUTH2");
 
-                jSession    = createObject("java","javax.mail.Session").getInstance(props);
-                imapStore   = jSession.getStore("imaps");
+                jSession   = createObject("java","javax.mail.Session").getInstance(props);
+                imapStore  = jSession.getStore("imaps");
                 imapStore.connect(acct.host, acct.username, xoauth2Token);
-                imapFolder  = imapStore.getFolder(mailbox);
+                imapFolder = imapStore.getFolder(mailbox);
                 imapFolder.open(createObject("java","javax.mail.Folder").READ_WRITE);
-                flagSeen    = createObject("java","javax.mail.Flags$Flag");
-                searchTerm  = createObject("java","javax.mail.search.FlagTerm").init(
+                flagSeen   = createObject("java","javax.mail.Flags$Flag");
+                searchTerm = createObject("java","javax.mail.search.FlagTerm").init(
                     createObject("java","javax.mail.Flags").init(flagSeen.SEEN),
                     javaCast("boolean",false)
                 );
@@ -141,49 +141,57 @@
 
             } else {
 
+                // Password auth: use cfimap getHeaderList to get UIDs of all messages,
+                // then fetch each one individually with getMessage.
+                // Valid cfimap attributes per Lucee:
+                //   action, server, port, username, password, secure, folder,
+                //   name, uid, messagenumber, attachmentpath, maxrows, startrow, timeout
+                // Note: there is no messageType/type filter — we fetch all and skip
+                // already-seen ones via the message_id deduplication check.
                 cfimap(
-                    action      = "getHeaderList",
-                    server      = acct.host,
-                    port        = acct.port,
-                    username    = acct.username,
-                    password    = imapPassword,
-                    secure      = (acct.use_ssl ? true : false),
-                    folder      = mailbox,
-                    messageType = "UNSEEN",
-                    name        = "qMessages",
-                    maxRows     = application.poller.batchSize
+                    action   = "getHeaderList",
+                    server   = acct.host,
+                    port     = acct.port,
+                    username = acct.username,
+                    password = imapPassword,
+                    secure   = (acct.use_ssl ? true : false),
+                    folder   = mailbox,
+                    name     = "qMessages",
+                    maxRows  = application.poller.batchSize
                 );
                 useJavaMail = false;
                 msgCount    = qMessages.recordCount;
             }
 
-            logLine("#msgCount# unread message(s)");
+            logLine("#msgCount# message(s) in mailbox");
 
             for (msgIdx = 1; msgIdx LTE msgCount; msgIdx++) {
 
                 try {
                     if (useJavaMail) {
-                        jMsg       = jMessages[msgIdx - 1];
-                        msgUID     = javaCast("string", jMsg.getMessageNumber());
-                        msgSubject = javaCast("string", jMsg.getSubject() ?: "");
-                        msgFrom    = javaCast("string", jMsg.getFrom()[1].toString() ?: "");
+
+                        jMsg         = jMessages[msgIdx - 1];
+                        msgUID       = javaCast("string", jMsg.getMessageNumber());
+                        msgSubject   = javaCast("string", jMsg.getSubject() ?: "");
+                        msgFrom      = javaCast("string", jMsg.getFrom()[1].toString() ?: "");
                         contentType  = javaCast("string", jMsg.getContentType() ?: "");
                         msgMessageId = javaCast("string", jMsg.getHeader("Message-ID")[1] ?: createUUID());
                         msgBody      = "";
                         attachments  = [];
+
                         content = jMsg.getContent();
-                        if (isInstanceOf(content,"javax.mail.Multipart")) {
+                        if (isInstanceOf(content, "javax.mail.Multipart")) {
                             for (pIdx = 0; pIdx LT content.getCount(); pIdx++) {
                                 part     = content.getBodyPart(pIdx);
                                 partDisp = javaCast("string", part.getDisposition() ?: "");
                                 partCT   = javaCast("string", part.getContentType() ?: "");
                                 if (partDisp EQ "ATTACHMENT"
-                                    OR reFindNoCase("(application/zip|application/gzip|application/x-gzip|application/octet-stream|text/xml|application/xml)",partCT)) {
+                                    OR reFindNoCase("(application/zip|application/gzip|application/x-gzip|application/octet-stream|text/xml|application/xml)", partCT)) {
                                     partName = javaCast("string", part.getFileName() ?: "att_#pIdx#");
                                     partIS   = part.getInputStream();
-                                    baos = createObject("java","java.io.ByteArrayOutputStream").init();
-                                    buf  = createObject("java","java.lang.reflect.Array").newInstance(
-                                        createObject("java","java.lang.Byte").TYPE, javaCast("int",8192));
+                                    baos     = createObject("java","java.io.ByteArrayOutputStream").init();
+                                    buf      = createObject("java","java.lang.reflect.Array").newInstance(
+                                                   createObject("java","java.lang.Byte").TYPE, javaCast("int",8192));
                                     bytesRead = partIS.read(buf);
                                     while (bytesRead GT 0) {
                                         baos.write(buf, javaCast("int",0), javaCast("int",bytesRead));
@@ -200,30 +208,63 @@
                         }
 
                     } else {
-                        cfimap(action="getMessageBody", server=acct.host, port=acct.port,
-                               username=acct.username, password=imapPassword,
-                               secure=(acct.use_ssl?true:false), folder=mailbox,
-                               uid=msgUID, name="qMsgBody");
-                        msgSubject   = qMessages.subject[msgIdx];
-                        msgFrom      = qMessages.from[msgIdx];
+
+                        // cfimap action="getMessage" fetches full message + saves attachments.
+                        // Returns a query with columns: subject, from, to, date, body,
+                        //   htmlbody, cc, replyto, messageid, uid, size, header, attachments
+                        attachDir = getTempDirectory() & "dmarc_att_" & createUUID() & "/";
+                        directoryCreate(attachDir);
+
+                        cfimap(
+                            action         = "getMessage",
+                            server         = acct.host,
+                            port           = acct.port,
+                            username       = acct.username,
+                            password       = imapPassword,
+                            secure         = (acct.use_ssl ? true : false),
+                            folder         = mailbox,
+                            uid            = qMessages.uid[msgIdx],
+                            attachmentPath = attachDir,
+                            name           = "qMsg",
+                            generateUniqueFileNames = true
+                        );
+
+                        msgSubject   = qMsg.subject;
+                        msgFrom      = qMsg.from;
                         msgUID       = qMessages.uid[msgIdx];
-                        msgBody      = qMsgBody.body;
-                        contentType  = qMsgBody.contentType;
-                        msgMessageId = qMsgBody.messageId ?: createUUID();
+                        msgBody      = len(qMsg.body) ? qMsg.body : qMsg.htmlbody;
+                        contentType  = qMsg.header;  // full headers — we'll search within
+                        msgMessageId = qMsg.messageid;
                         attachments  = [];
-                        cfimap(action="getAttachments", server=acct.host, port=acct.port,
-                               username=acct.username, password=imapPassword,
-                               secure=(acct.use_ssl?true:false), folder=mailbox,
-                               uid=msgUID, attachmentPath=getTempDirectory(), name="qAttach");
-                        if (qAttach.recordCount) {
-                            for (attRow in qAttach) {
-                                if (fileExists(attRow.file))
-                                    attachments.append({name:attRow.fileName, file:attRow.file});
+
+                        // Collect any saved attachment files
+                        if (len(trim(qMsg.attachments))) {
+                            for (attPath in listToArray(qMsg.attachments, chr(13) & chr(10))) {
+                                attPath = trim(attPath);
+                                if (len(attPath) AND fileExists(attPath)) {
+                                    arrayAppend(attachments, {
+                                        name : listLast(attPath, "/\"),
+                                        file : attPath
+                                    });
+                                }
+                            }
+                        }
+                        // Also scan the temp dir directly for any attachments
+                        if (directoryExists(attachDir)) {
+                            qAttFiles = directoryList(attachDir, false, "query");
+                            for (af in qAttFiles) {
+                                if (NOT arrayFind(attachments.map(function(a){return a.file;}), af.directory & "/" & af.name)) {
+                                    arrayAppend(attachments, {name:af.name, file:af.directory & "/" & af.name});
+                                }
                             }
                         }
                     }
 
-                    cleanMsgId = reReplace(msgMessageId, "[<>\s]", "", "ALL");
+                    // Deduplicate by Message-ID
+                    cleanMsgId = len(trim(msgMessageId))
+                                 ? reReplace(msgMessageId, "[<>\s]", "", "ALL")
+                                 : createUUID();
+
                     qDupe = queryExecute("SELECT id FROM report WHERE message_id=? LIMIT 1",
                         [{value:cleanMsgId, cfsqltype:"cf_sql_varchar"}],
                         {datasource:application.db.dsn});
@@ -240,8 +281,9 @@
                         continue;
                     }
 
-                    isRUF = reFindNoCase("multipart/report",contentType)
-                            AND reFindNoCase("report-type=feedback-report",contentType);
+                    // Route: RUF (forensic) vs RUA (aggregate)
+                    isRUF = reFindNoCase("multipart/report", contentType)
+                            AND reFindNoCase("report-type=feedback-report", contentType);
                     if (NOT isRUF) isRUF = reFindNoCase("feedback-report", msgBody);
 
                     if (isRUF) {
@@ -260,7 +302,7 @@
                     totalNew++;
 
                 } catch(any msgErr) {
-                    logLine("  ERROR msg ##msgIdx: #msgErr.message#", "ERROR");
+                    logLine("  ERROR msg ##msgIdx: #msgErr.message# | #msgErr.detail#", "ERROR");
                     totalError++;
                 }
             }
@@ -280,7 +322,7 @@
             );
 
         } catch(any acctErr) {
-            logLine("ACCOUNT ERROR (#acct.label#): #acctErr.message#", "ERROR");
+            logLine("ACCOUNT ERROR (#acct.label#): #acctErr.message# | #acctErr.detail#", "ERROR");
             totalError++;
             queryExecute("UPDATE imap_accounts SET last_status=? WHERE id=?",
                 [{value:"Error: " & left(acctErr.message,200), cfsqltype:"cf_sql_varchar"},{value:acct.id,cfsqltype:"cf_sql_integer"}],
