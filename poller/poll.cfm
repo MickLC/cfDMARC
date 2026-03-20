@@ -1,7 +1,19 @@
 <!--- poller/poll.cfm
       DMARC report poller entry point for cfschedule.
       Localhost access only.
---->\n<cfinclude template="/includes/functions.cfm">
+
+      cfimap action reference (Lucee):
+        getHeaderOnly  - fetch headers only (subject, from, date, uid, messageNumber)
+        getAll         - fetch full message inc. body + save attachments to attachmentPath
+        markRead       - mark message(s) read by uid or messageNumber
+        delete         - delete message(s)
+        open/close     - persistent named connection
+
+      Strategy: open one persistent connection per account, use it for all
+      sub-calls (getAll, markRead), then close it.  This avoids re-authenticating
+      for every message and makes markRead simpler (no server/port repeat needed).
+--->
+<cfinclude template="/includes/functions.cfm">
 
 <cfscript>
     if (cgi.remote_addr NEQ "127.0.0.1" AND cgi.remote_addr NEQ "::1") {
@@ -108,11 +120,14 @@
                 continue;
             }
 
-            mailbox = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
+            mailbox    = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
+            connLabel  = "dmarc_poll_#acct.id#";
+            attachBase = getTempDirectory() & "dmarc_poll/";
+            if (NOT directoryExists(attachBase)) directoryCreate(attachBase);
 
             if (acct.auth_type EQ "oauth2") {
 
-                // OAuth2: use JavaMail directly with XOAUTH2 SASL mechanism
+                // OAuth2: JavaMail with XOAUTH2 — cfimap has no XOAUTH2 support
                 xoauth2Raw   = "user=#acct.username#" & chr(1) & "auth=Bearer #imapPassword#" & chr(1) & chr(1);
                 xoauth2Token = toBase64(xoauth2Raw);
 
@@ -141,26 +156,33 @@
 
             } else {
 
-                // Password auth: use cfimap getHeaderList to get UIDs of all messages,
-                // then fetch each one individually with getMessage.
-                // Valid cfimap attributes per Lucee:
-                //   action, server, port, username, password, secure, folder,
-                //   name, uid, messagenumber, attachmentpath, maxrows, startrow, timeout
-                // Note: there is no messageType/type filter — we fetch all and skip
-                // already-seen ones via the message_id deduplication check.
+                // Password auth: open a persistent named connection, then use
+                // getHeaderOnly to list messages and getAll to fetch each one.
+                // Using a connection label avoids repeating server/port/credentials
+                // on every cfimap call and makes markRead straightforward.
                 cfimap(
-                    action   = "getHeaderList",
+                    action   = "open",
+                    connection = connLabel,
                     server   = acct.host,
                     port     = acct.port,
                     username = acct.username,
                     password = imapPassword,
                     secure   = (acct.use_ssl ? true : false),
-                    folder   = mailbox,
-                    name     = "qMessages",
-                    maxRows  = application.poller.batchSize
+                    timeout  = 60
                 );
+
+                // getHeaderOnly returns: subject, from, to, cc, date, uid,
+                //   messageNumber, size, replyTo, header (raw headers string)
+                cfimap(
+                    action     = "getHeaderOnly",
+                    connection = connLabel,
+                    folder     = mailbox,
+                    name       = "qHeaders",
+                    maxRows    = application.poller.batchSize
+                );
+
                 useJavaMail = false;
-                msgCount    = qMessages.recordCount;
+                msgCount    = qHeaders.recordCount;
             }
 
             logLine("#msgCount# message(s) in mailbox");
@@ -173,7 +195,6 @@
                         jMsg         = jMessages[msgIdx - 1];
                         msgUID       = javaCast("string", jMsg.getMessageNumber());
                         msgSubject   = javaCast("string", jMsg.getSubject() ?: "");
-                        msgFrom      = javaCast("string", jMsg.getFrom()[1].toString() ?: "");
                         contentType  = javaCast("string", jMsg.getContentType() ?: "");
                         msgMessageId = javaCast("string", jMsg.getHeader("Message-ID")[1] ?: createUUID());
                         msgBody      = "";
@@ -209,61 +230,45 @@
 
                     } else {
 
-                        // cfimap action="getMessage" fetches full message + saves attachments.
-                        // Returns a query with columns: subject, from, to, date, body,
-                        //   htmlbody, cc, replyto, messageid, uid, size, header, attachments
-                        attachDir = getTempDirectory() & "dmarc_att_" & createUUID() & "/";
-                        directoryCreate(attachDir);
+                        // Fetch the full message via the open connection.
+                        // getAll with a specific uid fetches just that message.
+                        // attachmentPath must exist; we use a per-message subdir.
+                        msgUID    = qHeaders.uid[msgIdx];
+                        attachDir = attachBase & msgUID & "/";
+                        if (NOT directoryExists(attachDir)) directoryCreate(attachDir);
 
                         cfimap(
-                            action         = "getMessage",
-                            server         = acct.host,
-                            port           = acct.port,
-                            username       = acct.username,
-                            password       = imapPassword,
-                            secure         = (acct.use_ssl ? true : false),
-                            folder         = mailbox,
-                            uid            = qMessages.uid[msgIdx],
-                            attachmentPath = attachDir,
-                            name           = "qMsg",
-                            generateUniqueFileNames = true
+                            action                 = "getAll",
+                            connection             = connLabel,
+                            folder                 = mailbox,
+                            uid                    = msgUID,
+                            attachmentPath         = attachDir,
+                            generateUniqueFilenames = true,
+                            name                   = "qMsg"
                         );
 
                         msgSubject   = qMsg.subject;
-                        msgFrom      = qMsg.from;
-                        msgUID       = qMessages.uid[msgIdx];
-                        msgBody      = len(qMsg.body) ? qMsg.body : qMsg.htmlbody;
-                        contentType  = qMsg.header;  // full headers — we'll search within
-                        msgMessageId = qMsg.messageid;
+                        // getAll header column contains the full raw RFC 2822 headers
+                        contentType  = qMsg.header;
+                        msgMessageId = len(trim(qMsg.messageId)) ? qMsg.messageId : createUUID();
+                        msgBody      = len(trim(qMsg.body)) ? qMsg.body : (structKeyExists(qMsg,"htmlBody") ? qMsg.htmlBody : "");
                         attachments  = [];
 
-                        // Collect any saved attachment files
-                        if (len(trim(qMsg.attachments))) {
-                            for (attPath in listToArray(qMsg.attachments, chr(13) & chr(10))) {
-                                attPath = trim(attPath);
-                                if (len(attPath) AND fileExists(attPath)) {
-                                    arrayAppend(attachments, {
-                                        name : listLast(attPath, "/\"),
-                                        file : attPath
-                                    });
-                                }
-                            }
-                        }
-                        // Also scan the temp dir directly for any attachments
+                        // Collect saved attachment files from the per-message dir
                         if (directoryExists(attachDir)) {
-                            qAttFiles = directoryList(attachDir, false, "query");
+                            qAttFiles = directoryList(attachDir, false, "query", "*.xml|*.zip|*.gz");
                             for (af in qAttFiles) {
-                                if (NOT arrayFind(attachments.map(function(a){return a.file;}), af.directory & "/" & af.name)) {
-                                    arrayAppend(attachments, {name:af.name, file:af.directory & "/" & af.name});
-                                }
+                                arrayAppend(attachments, {
+                                    name : af.name,
+                                    file : af.directory & "/" & af.name
+                                });
                             }
                         }
                     }
 
                     // Deduplicate by Message-ID
-                    cleanMsgId = len(trim(msgMessageId))
-                                 ? reReplace(msgMessageId, "[<>\s]", "", "ALL")
-                                 : createUUID();
+                    cleanMsgId = reReplace(trim(msgMessageId), "[<>\s]", "", "ALL");
+                    if (NOT len(cleanMsgId)) cleanMsgId = createUUID();
 
                     qDupe = queryExecute("SELECT id FROM report WHERE message_id=? LIMIT 1",
                         [{value:cleanMsgId, cfsqltype:"cf_sql_varchar"}],
@@ -276,7 +281,7 @@
                             if (useJavaMail)
                                 jMsg.setFlag(createObject("java","javax.mail.Flags$Flag").SEEN, true);
                             else
-                                try { cfimap(action="markRead",server=acct.host,port=acct.port,username=acct.username,password=imapPassword,secure=(acct.use_ssl?true:false),folder=mailbox,uid=msgUID); } catch(any e2) {}
+                                try { cfimap(action="markRead", connection=connLabel, folder=mailbox, uid=msgUID); } catch(any e2) {}
                         }
                         continue;
                     }
@@ -287,16 +292,18 @@
                     if (NOT isRUF) isRUF = reFindNoCase("feedback-report", msgBody);
 
                     if (isRUF) {
-                        logLine("  -> RUF"); include "/poller/parse_ruf.cfm";
+                        logLine("  -> RUF (subject: #msgSubject#)");
+                        include "/poller/parse_ruf.cfm";
                     } else {
-                        logLine("  -> RUA"); include "/poller/parse_rua.cfm";
+                        logLine("  -> RUA (subject: #msgSubject#)");
+                        include "/poller/parse_rua.cfm";
                     }
 
                     if (application.poller.markAsRead) {
                         if (useJavaMail)
                             jMsg.setFlag(createObject("java","javax.mail.Flags$Flag").SEEN, true);
                         else
-                            try { cfimap(action="markRead",server=acct.host,port=acct.port,username=acct.username,password=imapPassword,secure=(acct.use_ssl?true:false),folder=mailbox,uid=msgUID); } catch(any ignored) {}
+                            try { cfimap(action="markRead", connection=connLabel, folder=mailbox, uid=msgUID); } catch(any ignored) {}
                     }
 
                     totalNew++;
@@ -307,9 +314,12 @@
                 }
             }
 
+            // Close connections
             if (useJavaMail) {
                 try { imapFolder.close(false); } catch(any e) {}
                 try { imapStore.close();        } catch(any e) {}
+            } else {
+                try { cfimap(action="close", connection=connLabel); } catch(any e) {}
             }
 
             queryExecute(
@@ -324,6 +334,8 @@
         } catch(any acctErr) {
             logLine("ACCOUNT ERROR (#acct.label#): #acctErr.message# | #acctErr.detail#", "ERROR");
             totalError++;
+            // Attempt to close connection if it was opened
+            try { cfimap(action="close", connection=connLabel); } catch(any e) {}
             queryExecute("UPDATE imap_accounts SET last_status=? WHERE id=?",
                 [{value:"Error: " & left(acctErr.message,200), cfsqltype:"cf_sql_varchar"},{value:acct.id,cfsqltype:"cf_sql_integer"}],
                 {datasource:application.db.dsn});
@@ -333,17 +345,21 @@
     elapsed = dateDiff("s", pollStart, now());
     logLine("=== Done: #totalNew# new, #totalSkip# skipped, #totalError# errors, #elapsed#s ===");
 
-    queryExecute(
-        "INSERT INTO poller_runs (run_at,new_reports,skipped,errors,elapsed_sec,log_text)
-         VALUES (NOW(),?,?,?,?,?)",
-        [
-            {value:totalNew,   cfsqltype:"cf_sql_integer"},
-            {value:totalSkip,  cfsqltype:"cf_sql_integer"},
-            {value:totalError, cfsqltype:"cf_sql_integer"},
-            {value:elapsed,    cfsqltype:"cf_sql_integer"},
-            {value:left(arrayToList(pollLog,chr(10)),8000), cfsqltype:"cf_sql_clob"}
-        ],
-        {datasource:application.db.dsn}
-    );
+    try {
+        queryExecute(
+            "INSERT INTO poller_runs (run_at,new_reports,skipped,errors,elapsed_sec,log_text)
+             VALUES (NOW(),?,?,?,?,?)",
+            [
+                {value:totalNew,   cfsqltype:"cf_sql_integer"},
+                {value:totalSkip,  cfsqltype:"cf_sql_integer"},
+                {value:totalError, cfsqltype:"cf_sql_integer"},
+                {value:elapsed,    cfsqltype:"cf_sql_integer"},
+                {value:left(arrayToList(pollLog,chr(10)),8000), cfsqltype:"cf_sql_clob"}
+            ],
+            {datasource:application.db.dsn}
+        );
+    } catch(any logErr) {
+        cflog(file="dmarc_poller", text="Failed to insert poller_run: #logErr.message#", type="error");
+    }
 </cfscript>
 <cfoutput>OK: #totalNew# new / #totalSkip# skipped / #totalError# errors</cfoutput>
