@@ -14,7 +14,7 @@
 
 <cfif CGI.REQUEST_METHOD EQ "POST" AND len(trim(form.username)) AND len(trim(form.password))>
     <cfscript>
-        var _user = queryExecute(
+        _user = queryExecute(
             "SELECT id, username, password_hash, active FROM users WHERE username = ? LIMIT 1",
             [ trim(form.username) ],
             { datasource: application.db.dsn }
@@ -23,7 +23,7 @@
         if (_user.recordCount EQ 1 AND _user.active EQ 1
             AND verifyPassword(trim(form.password), _user.password_hash)) {
 
-            var _token = generateToken(64);
+            _token = generateToken(64);
             queryExecute(
                 "INSERT INTO sessions (id, user_id, ip_address, user_agent, expires_at)
                  VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 8 HOUR))",
@@ -53,7 +53,6 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <!--- Title reads from application.appName set in config/settings.cfm --->
     <title>Sign In — <cfoutput>#htmlEditFormat(application.appName)#</cfoutput></title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -90,7 +89,6 @@
 <body>
 <div class="login-wrap">
     <div class="login-brand">
-        <!--- Brand reads from application.appName set in config/settings.cfm --->
         <div class="mono"><cfoutput>#htmlEditFormat(application.appName)#</cfoutput></div>
         <h1>Sign In</h1>
     </div>

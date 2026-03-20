@@ -9,8 +9,8 @@
     }
     include "/includes/functions.cfm";
 
-    var _authenticated = false;
-    var _redirectTo    = CGI.SCRIPT_NAME;
+    _authenticated = false;
+    _redirectTo    = CGI.SCRIPT_NAME;
     if (len(CGI.QUERY_STRING)) _redirectTo &= "?" & CGI.QUERY_STRING;
 
     if (structKeyExists(session, "loggedIn")
@@ -18,7 +18,7 @@
         AND structKeyExists(session, "sessionToken")
         AND len(session.sessionToken)) {
 
-        var _tokenCheck = queryExecute(
+        _tokenCheck = queryExecute(
             "SELECT s.id, s.user_id, u.username
              FROM sessions s
              JOIN users u ON u.id = s.user_id
@@ -46,7 +46,7 @@
 
     if (NOT _authenticated) {
         location(
-            url  = "/admin/login.cfm?redir=" & urlEncodedFormat(_redirectTo),
+            url      = "/admin/login.cfm?redir=" & urlEncodedFormat(_redirectTo),
             addToken = false
         );
         abort;

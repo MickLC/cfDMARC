@@ -11,7 +11,7 @@
 <cfset variables.success = "">
 <cfset variables.done    = false>
 <cfscript>
-    var _userCount = queryExecute("SELECT COUNT(*) AS cnt FROM users", {}, { datasource: application.db.dsn });
+    _userCount = queryExecute("SELECT COUNT(*) AS cnt FROM users", {}, { datasource: application.db.dsn });
     if (_userCount.cnt GT 0) {
         variables.error = "Setup has already been completed. Delete this file from the server.";
         variables.done  = true;
@@ -19,14 +19,14 @@
 </cfscript>
 <cfif CGI.REQUEST_METHOD EQ "POST" AND NOT variables.done>
     <cfscript>
-        var errs = [];
+        errs = [];
         if (NOT len(trim(form.username)))           arrayAppend(errs, "Username is required.");
         if (NOT len(trim(form.email)))              arrayAppend(errs, "Email is required.");
         if (len(trim(form.password)) LT 12)         arrayAppend(errs, "Password must be at least 12 characters.");
         if (form.password NEQ form.confirm)         arrayAppend(errs, "Passwords do not match.");
         if (NOT isValid("email", trim(form.email))) arrayAppend(errs, "Invalid email address.");
         if (arrayLen(errs) EQ 0) {
-            var _hash = hashPassword(trim(form.password));
+            _hash = hashPassword(trim(form.password));
             queryExecute(
                 "INSERT INTO users (username, email, password_hash, active) VALUES (?, ?, ?, 1)",
                 [ trim(form.username), trim(form.email), _hash ],

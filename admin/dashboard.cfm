@@ -4,12 +4,12 @@
 
 <cfscript>
     param name="url.days" default="90";
-    var filterDays = isNumeric(url.days) ? int(url.days) : 90;
+    filterDays = isNumeric(url.days) ? int(url.days) : 90;
     if (NOT listFind("7,30,90,365,0", filterDays)) filterDays = 90;
-    var dateLabel  = filterDays EQ 0 ? "All time" : "Last #filterDays# days";
-    var dateClause = filterDays GT 0 ? "AND rpt.mindate >= DATE_SUB(NOW(), INTERVAL #filterDays# DAY)" : "";
+    dateLabel  = filterDays EQ 0 ? "All time" : "Last #filterDays# days";
+    dateClause = filterDays GT 0 ? "AND rpt.mindate >= DATE_SUB(NOW(), INTERVAL #filterDays# DAY)" : "";
 
-    var qStats = queryExecute("
+    qStats = queryExecute("
         SELECT
             COUNT(DISTINCT rpt.id)                                               AS report_count,
             COUNT(DISTINCT rpt.domain)                                           AS domain_count,
@@ -22,12 +22,12 @@
         WHERE 1=1 #dateClause#
     ", {}, { datasource: application.db.dsn });
 
-    var totalMessages = qStats.total_messages;
-    var totalPass     = qStats.total_pass;
-    var totalFail     = qStats.total_fail;
-    var passRate      = totalMessages GT 0 ? numberFormat(100 * totalPass / totalMessages, "99.9") : 0;
+    totalMessages = qStats.total_messages;
+    totalPass     = qStats.total_pass;
+    totalFail     = qStats.total_fail;
+    passRate      = totalMessages GT 0 ? numberFormat(100 * totalPass / totalMessages, "99.9") : 0;
 
-    var qDomains = queryExecute("
+    qDomains = queryExecute("
         SELECT rpt.domain,
             SUM(rec.rcount) AS messages,
             ROUND(100.0 * SUM(CASE WHEN rec.dkim_align='pass' OR rec.spf_align='pass' THEN rec.rcount ELSE 0 END)
@@ -39,7 +39,7 @@
         GROUP BY rpt.domain ORDER BY messages DESC
     ", {}, { datasource: application.db.dsn });
 
-    var qTrend = queryExecute("
+    qTrend = queryExecute("
         SELECT DATE(rpt.mindate) AS report_date,
             SUM(rec.rcount) AS messages,
             SUM(CASE WHEN rec.dkim_align='pass' OR rec.spf_align='pass' THEN rec.rcount ELSE 0 END) AS pass_count
@@ -49,14 +49,16 @@
         GROUP BY DATE(rpt.mindate) ORDER BY report_date ASC
     ", {}, { datasource: application.db.dsn });
 
-    var chartDates=[];var chartMessages=[];var chartPassRate=[];
-    for (var row in qTrend) {
-        arrayAppend(chartDates, '"#dateFormat(row.report_date,"mmm d")#"');
+    chartDates    = [];
+    chartMessages = [];
+    chartPassRate = [];
+    for (row in qTrend) {
+        arrayAppend(chartDates,    '"#dateFormat(row.report_date, "mmm d")#"');
         arrayAppend(chartMessages, row.messages);
-        arrayAppend(chartPassRate, row.messages GT 0 ? numberFormat(100*row.pass_count/row.messages,"99.9") : 0);
+        arrayAppend(chartPassRate, row.messages GT 0 ? numberFormat(100*row.pass_count/row.messages, "99.9") : 0);
     }
 
-    var qRecent = queryExecute("
+    qRecent = queryExecute("
         SELECT rpt.id, rpt.domain, rpt.org, rpt.received_at,
             SUM(rec.rcount) AS message_count,
             SUM(CASE WHEN rec.dkim_align='pass' OR rec.spf_align='pass' THEN rec.rcount ELSE 0 END) AS pass_count
@@ -65,7 +67,7 @@
         GROUP BY rpt.id ORDER BY rpt.received_at DESC LIMIT 10
     ", {}, { datasource: application.db.dsn });
 
-    var qFailSources = queryExecute("
+    qFailSources = queryExecute("
         SELECT CASE WHEN rec.ip IS NOT NULL THEN INET_NTOA(rec.ip)
                     WHEN rec.ip6 IS NOT NULL THEN HEX(rec.ip6) ELSE 'unknown' END AS source_ip,
             rpt.domain,
