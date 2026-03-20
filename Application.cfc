@@ -32,15 +32,13 @@
     </cffunction>
 
     <!---
-        onError contains zero # characters — Lucee treats # as an expression
-        delimiter in every string literal in every context (tag attrs, cfscript
-        double/single-quoted strings, HTML entity refs, CSS hex colors, all of it).
-        Solutions used here:
-          - CSS colors  -> rgb() / rgba()
-          - HTML entities -> chr()  e.g. chr(9888) warning, chr(8592) left arrow
-          - Quoted HTML attrs -> chr(34) for double-quote inside cfscript strings
+        output="true" is required so cfoutput actually reaches the browser.
+        The entire HTML page is built as a string in cfscript (no # chars
+        anywhere in any literal — rgb() for colors, chr() for special chars),
+        then emitted via a single <cfoutput>#local.html#</cfoutput> where the
+        only # characters are the valid variable delimiters around local.html.
     --->
-    <cffunction name="onError" returntype="void" output="false">
+    <cffunction name="onError" returntype="void" output="true">
         <cfargument name="exception" required="true">
         <cfargument name="eventName" type="string" required="true">
         <cfscript>
@@ -68,6 +66,8 @@
                 local.hint = "Encryption error. Check application.encryptionKey in config/settings.cfm.";
             }
 
+            // No # characters in any string literal below.
+            // Colors: rgb(). Special chars: chr(). Quotes: chr(34).
             local.css = "body{margin:0;background:rgb(13,17,23);color:rgb(230,237,243);font-family:sans-serif;padding:2rem;}"
                 & ".ec{background:rgb(28,33,40);border:1px solid rgb(48,54,61);border-radius:6px;padding:1.5rem;max-width:900px;margin:2rem auto;}"
                 & "h2{color:rgb(248,81,73);font-size:1.1rem;margin-bottom:1rem;}"
@@ -121,9 +121,9 @@
                 & "<a href=" & local.q & "javascript:history.back()" & local.q & " class=" & local.q & "bt" & local.q & ">" & local.larr & " Back</a> "
                 & "<a href=" & local.q & "/admin/dashboard.cfm" & local.q & " class=" & local.q & "bt" & local.q & ">Dashboard</a>"
                 & "</div></div></body></html>";
-
-            writeOutput(local.html);
         </cfscript>
+        <!--- Single cfoutput — the only # chars in this file are these two delimiters --->
+        <cfoutput>#local.html#</cfoutput>
     </cffunction>
 
 </cfcomponent>
