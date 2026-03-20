@@ -32,15 +32,13 @@
     </cffunction>
 
     <!---
-        IMPORTANT: Lucee parses the # character as an expression delimiter in
-        every string literal in every context — tag attributes, cfoutput bodies,
-        cfscript double-quoted strings, cfscript single-quoted strings, ALL of them.
-        The only safe options are ## (escape) or avoid # entirely.
-
-        This function contains zero # characters:
-          - CSS colors use rgb() notation
-          - HTML entities use chr() e.g. chr(9888) for the warning sign
-          - No CDN URLs with fragment identifiers
+        onError contains zero # characters — Lucee treats # as an expression
+        delimiter in every string literal in every context (tag attrs, cfscript
+        double/single-quoted strings, HTML entity refs, CSS hex colors, all of it).
+        Solutions used here:
+          - CSS colors  -> rgb() / rgba()
+          - HTML entities -> chr()  e.g. chr(9888) warning, chr(8592) left arrow
+          - Quoted HTML attrs -> chr(34) for double-quote inside cfscript strings
     --->
     <cffunction name="onError" returntype="void" output="false">
         <cfargument name="exception" required="true">
@@ -59,18 +57,17 @@
 
             local.hint = "";
             if (findNoCase("Unknown column", arguments.exception.message)
-                OR findNoCase("doesn't exist", arguments.exception.message)
+                OR findNoCase("doesnt exist", arguments.exception.message)
                 OR (findNoCase("Table", arguments.exception.message) AND findNoCase("exist", arguments.exception.message))) {
-                local.hint = "This looks like a missing database table or column. Have you run all migrations? (db/migrations/004_poller_tables.sql)";
+                local.hint = "Missing database table or column. Have you run all migrations? (db/migrations/004_poller_tables.sql)";
             } else if (findNoCase("Access denied", arguments.exception.message)) {
                 local.hint = "Database access denied. Check credentials in config/settings.cfm and the MariaDB grant.";
             } else if (findNoCase("datasource", arguments.exception.message) OR findNoCase("No datasource", arguments.exception.message)) {
-                local.hint = "Lucee datasource not found. Verify the 'dmarc' datasource in the Lucee Web Admin.";
+                local.hint = "Lucee datasource not found. Verify the dmarc datasource in the Lucee Web Admin.";
             } else if (findNoCase("decrypt", arguments.exception.message) OR findNoCase("encryptionKey", arguments.exception.message)) {
                 local.hint = "Encryption error. Check application.encryptionKey in config/settings.cfm.";
             }
 
-            // Zero # characters below. Colors are rgb(). Entities use chr().
             local.css = "body{margin:0;background:rgb(13,17,23);color:rgb(230,237,243);font-family:sans-serif;padding:2rem;}"
                 & ".ec{background:rgb(28,33,40);border:1px solid rgb(48,54,61);border-radius:6px;padding:1.5rem;max-width:900px;margin:2rem auto;}"
                 & "h2{color:rgb(248,81,73);font-size:1.1rem;margin-bottom:1rem;}"
@@ -80,50 +77,49 @@
                 & ".bt{border:1px solid rgb(48,54,61);color:rgb(139,148,158);background:transparent;border-radius:4px;padding:.3rem .75rem;font-size:.85rem;text-decoration:none;display:inline-block;margin-right:.4rem;}"
                 & "a{color:rgb(56,139,253);}";
 
-            // chr(9888) = warning sign U+26A0; no HTML entity needed
+            local.q    = chr(34);
             local.warn = chr(9888);
+            local.larr = chr(8592);
 
-            local.html = "<!DOCTYPE html><html lang=""en""><head><meta charset=""UTF-8"">"
+            local.html = "<!DOCTYPE html><html lang=" & local.q & "en" & local.q & "><head><meta charset=" & local.q & "UTF-8" & local.q & ">"
                 & "<title>Error - DMARC Dashboard</title>"
                 & "<style>" & local.css & "</style>"
-                & "</head><body><div class=""ec"">"
+                & "</head><body><div class=" & local.q & "ec" & local.q & ">"
                 & "<h2>" & local.warn & " An error occurred</h2>";
 
             if (len(local.hint)) {
-                local.html &= "<div class=""ht"">" & htmlEditFormat(local.hint) & "</div>";
+                local.html &= "<div class=" & local.q & "ht" & local.q & ">" & htmlEditFormat(local.hint) & "</div>";
             }
 
             if (local.isAdmin) {
-                local.html &= "<div class=""lb"">Event</div>"
-                           &  "<div class=""vl"">" & htmlEditFormat(arguments.eventName) & "</div>";
-
-                local.html &= "<div class=""lb"">Message</div>"
-                           &  "<div class=""vl"">" & htmlEditFormat(arguments.exception.message) & "</div>";
-
+                local.html &= "<div class=" & local.q & "lb" & local.q & ">Event</div>"
+                           &  "<div class=" & local.q & "vl" & local.q & ">" & htmlEditFormat(arguments.eventName) & "</div>";
+                local.html &= "<div class=" & local.q & "lb" & local.q & ">Message</div>"
+                           &  "<div class=" & local.q & "vl" & local.q & ">" & htmlEditFormat(arguments.exception.message) & "</div>";
                 if (len(trim(arguments.exception.detail))) {
-                    local.html &= "<div class=""lb"">Detail</div>"
-                               &  "<div class=""vl"">" & htmlEditFormat(arguments.exception.detail) & "</div>";
+                    local.html &= "<div class=" & local.q & "lb" & local.q & ">Detail</div>"
+                               &  "<div class=" & local.q & "vl" & local.q & ">" & htmlEditFormat(arguments.exception.detail) & "</div>";
                 }
                 if (structKeyExists(arguments.exception, "queryError") AND len(trim(arguments.exception.queryError))) {
-                    local.html &= "<div class=""lb"">Query Error</div>"
-                               &  "<div class=""vl"">" & htmlEditFormat(arguments.exception.queryError) & "</div>";
+                    local.html &= "<div class=" & local.q & "lb" & local.q & ">Query Error</div>"
+                               &  "<div class=" & local.q & "vl" & local.q & ">" & htmlEditFormat(arguments.exception.queryError) & "</div>";
                 }
                 if (structKeyExists(arguments.exception, "sql") AND len(trim(arguments.exception.sql))) {
-                    local.html &= "<div class=""lb"">SQL</div>"
-                               &  "<div class=""vl"">" & htmlEditFormat(arguments.exception.sql) & "</div>";
+                    local.html &= "<div class=" & local.q & "lb" & local.q & ">SQL</div>"
+                               &  "<div class=" & local.q & "vl" & local.q & ">" & htmlEditFormat(arguments.exception.sql) & "</div>";
                 }
                 if (structKeyExists(arguments.exception, "stackTrace") AND len(trim(arguments.exception.stackTrace))) {
-                    local.html &= "<div class=""lb"">Stack Trace</div>"
-                               &  "<div class=""vl"">" & htmlEditFormat(arguments.exception.stackTrace) & "</div>";
+                    local.html &= "<div class=" & local.q & "lb" & local.q & ">Stack Trace</div>"
+                               &  "<div class=" & local.q & "vl" & local.q & ">" & htmlEditFormat(arguments.exception.stackTrace) & "</div>";
                 }
             } else {
-                local.html &= "<p style=""color:rgb(139,148,158);"">The error has been logged. "
-                           &  "<a href=""/admin/login.cfm"">Sign in</a> to see full details.</p>";
+                local.html &= "<p>The error has been logged. "
+                           &  "<a href=" & local.q & "/admin/login.cfm" & local.q & ">Sign in</a> to see full details.</p>";
             }
 
-            local.html &= "<div style=""margin-top:1rem;"">"
-                & "<a href=""javascript:history.back()"" class=""bt"">&#8592; Back</a>"
-                & "<a href=""/admin/dashboard.cfm"" class=""bt"">Dashboard</a>"
+            local.html &= "<div style=" & local.q & "margin-top:1rem;" & local.q & ">"
+                & "<a href=" & local.q & "javascript:history.back()" & local.q & " class=" & local.q & "bt" & local.q & ">" & local.larr & " Back</a> "
+                & "<a href=" & local.q & "/admin/dashboard.cfm" & local.q & " class=" & local.q & "bt" & local.q & ">Dashboard</a>"
                 & "</div></div></body></html>";
 
             writeOutput(local.html);
