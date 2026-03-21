@@ -29,19 +29,22 @@
 <cfscript>
 
     // -----------------------------------------------------------------------
-    // gmailApiGet(accessToken, path, params)
+    // gmailApiGet(accessToken, apiPath, params)
     //
-    // GET https://gmail.googleapis.com/gmail/v1/users/me/{path}
+    // GET https://gmail.googleapis.com/gmail/v1/users/me/{apiPath}
     // Returns deserialized JSON struct, or throws on HTTP error.
+    //
+    // NOTE: local variable deliberately named apiEndpoint (not url) to avoid
+    // collision with Lucee's built-in URL scope inside cfhttp tag attributes.
     // -----------------------------------------------------------------------
     function gmailApiGet(
         required string accessToken,
         required string apiPath,
         struct  params = {}
     ) {
-        var url = "https://gmail.googleapis.com/gmail/v1/users/me/" & arguments.apiPath;
+        var apiEndpoint = "https://gmail.googleapis.com/gmail/v1/users/me/" & arguments.apiPath;
         cfhttp(
-            url     = url,
+            url     = apiEndpoint,
             method  = "GET",
             result  = "gmailGetResp",
             timeout = 30
@@ -66,7 +69,7 @@
     }
 
     // -----------------------------------------------------------------------
-    // gmailApiPost(url, formFields)
+    // gmailApiPost(postUrl, fields)
     //
     // POST to an arbitrary URL (used for token refresh only).
     // Returns deserialized JSON struct.
@@ -133,7 +136,7 @@
     }
 
     // -----------------------------------------------------------------------
-    // getValidAccessToken(acct)
+    // getValidAccessToken(acctRow)
     //
     // Returns a live access token for the account, refreshing if the stored
     // token is absent, expired, or within 5 minutes of expiry.
@@ -156,9 +159,9 @@
                 throw(type="GmailAPI", message="No refresh token stored — re-authorize the account via Admin > Accounts");
 
             logLine("  Gmail: access token expired/missing — refreshing");
-            var rt       = decryptValue(acctRow.oauth_refresh_token);
-            var cs       = decryptValue(acctRow.oauth_client_secret);
-            var ci       = acctRow.oauth_client_id;
+            var rt = decryptValue(acctRow.oauth_refresh_token);
+            var cs = decryptValue(acctRow.oauth_client_secret);
+            var ci = acctRow.oauth_client_id;
             return refreshGmailToken(acctRow.id, rt, ci, cs);
         }
 
@@ -166,18 +169,15 @@
     }
 
     // -----------------------------------------------------------------------
-    // b64urlDecode(str)
+    // b64urlDecode(encoded)
     //
     // Gmail API returns attachment data as base64url (uses - and _ instead
-    // of + and /).  Java's Base64.getDecoder() handles standard base64 only;
-    // use getMimeDecoder() which also handles URL-safe alphabet.
+    // of + and /).  Translate to standard base64 before decoding.
     // -----------------------------------------------------------------------
     function b64urlDecode(required string encoded) {
-        // Translate URL-safe alphabet to standard base64
         var std = arguments.encoded
             .replace("-", "+", "all")
             .replace("_", "/", "all");
-        // Re-pad if necessary
         var pad = len(std) mod 4;
         if (pad EQ 2) std &= "==";
         else if (pad EQ 3) std &= "=";
@@ -200,7 +200,7 @@
     }
 
     // -----------------------------------------------------------------------
-    // findAttachmentParts(parts, msgId, accessToken)
+    // findAttachmentParts(parts, gmailMsgId, accessToken)
     //
     // Recursively walks a Gmail message payload parts[] tree.
     // Returns array of byte arrays for any ZIP/GZ/XML/octet-stream parts.
@@ -283,25 +283,15 @@
 
         try {
             if (arguments.deleteMsg) {
-                // TRASH is the API equivalent of delete for Gmail
-                cfhttp(
-                    url     = "https://gmail.googleapis.com/gmail/v1/users/me/messages/#arguments.gmailMsgId#/trash",
-                    method  = "POST",
-                    result  = "trashResp",
-                    timeout = 15
-                ) {
+                var trashEndpoint = "https://gmail.googleapis.com/gmail/v1/users/me/messages/#arguments.gmailMsgId#/trash";
+                cfhttp(url=trashEndpoint, method="POST", result="trashResp", timeout=15) {
                     cfhttpparam(type="header", name="Authorization",  value="Bearer #arguments.accessToken#");
                     cfhttpparam(type="header", name="Content-Length", value="0");
                 }
             } else if (arguments.markRead) {
-                // Remove UNREAD label
-                var modBody = serializeJSON({ removeLabelIds: ["UNREAD"] });
-                cfhttp(
-                    url     = "https://gmail.googleapis.com/gmail/v1/users/me/messages/#arguments.gmailMsgId#/modify",
-                    method  = "POST",
-                    result  = "modResp",
-                    timeout = 15
-                ) {
+                var modEndpoint = "https://gmail.googleapis.com/gmail/v1/users/me/messages/#arguments.gmailMsgId#/modify";
+                var modBody     = serializeJSON({ removeLabelIds: ["UNREAD"] });
+                cfhttp(url=modEndpoint, method="POST", result="modResp", timeout=15) {
                     cfhttpparam(type="header", name="Authorization",  value="Bearer #arguments.accessToken#");
                     cfhttpparam(type="header", name="Content-Type",   value="application/json");
                     cfhttpparam(type="body",   value=modBody);
@@ -395,8 +385,8 @@
                         gmailHeaders = structKeyExists(gmailPayload, "headers") ? gmailPayload.headers : [];
 
                         // Extract Message-ID for deduplication
-                        rawMsgId    = extractHeaderValue(gmailHeaders, "message-id");
-                        cleanMsgId  = reReplace(trim(rawMsgId), "[<>\s]", "", "ALL");
+                        rawMsgId   = extractHeaderValue(gmailHeaders, "message-id");
+                        cleanMsgId = reReplace(trim(rawMsgId), "[<>\s]", "", "ALL");
                         if (NOT len(cleanMsgId)) cleanMsgId = "gmail-" & gmailMsgId;
 
                         msgSubject  = extractHeaderValue(gmailHeaders, "subject");
@@ -422,8 +412,6 @@
                         // Step 5: collect attachment bytes from payload tree
                         attachments = [];
 
-                        // Top-level payload may itself be an attachment (unlikely for email
-                        // but handle for completeness) — or the parts array has what we need.
                         if (structKeyExists(gmailPayload, "parts") AND isArray(gmailPayload.parts) AND arrayLen(gmailPayload.parts)) {
                             var rawBytesList = findAttachmentParts(gmailPayload.parts, gmailMsgId, gmailToken);
                             for (var rb in rawBytesList) {
@@ -452,7 +440,6 @@
                         }
 
                         // Step 6: detect RUF vs RUA and parse
-                        // Gmail strips raw MIME so we use the content-type header.
                         isRUF = reFindNoCase("multipart/report", contentType)
                                 AND reFindNoCase("report-type=feedback-report", contentType);
 
