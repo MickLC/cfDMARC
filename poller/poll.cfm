@@ -12,6 +12,8 @@
       Architecture:
         Password accounts (local Dovecot):
           - cfimap getHeaderOnly  : list messages, get UIDs and Message-IDs for dedup
+                                    exposes seen/answered/deleted/draft/flagged/recent
+                                    as individual boolean columns (not a flags string)
           - doveadm fetch         : retrieve hdr + body per UID (fields: "hdr body")
           - doveadm flags add     : mark \Seen (cfimap markRead silently fails on Dovecot)
           - extractDmarcAttachment: parse raw MIME body, locate ZIP/GZ/XML part,
@@ -47,10 +49,9 @@
     totalSkip  = 0;
     totalError = 0;
 
-    // IMAP \Seen flag as a literal string - chr(92) is backslash.
+    // IMAP \Seen flag as a literal string for doveadm - chr(92) is backslash.
     // Do NOT write "\Seen" in a CFML string literal: Lucee treats \S as an
-    // escape sequence and the backslash is dropped, breaking both the flag
-    // check (findNoCase) and the doveadm flags add argument.
+    // escape sequence and the backslash is dropped.
     SEEN_FLAG = chr(92) & "Seen";
 
     function logLine(required string msg, string level="INFO") {
@@ -359,7 +360,9 @@
 
             // Lucee's cfimap does not support messageType="unread" (ColdFusion-only).
             // Fetch all headers up to batchSize, then skip already-seen messages
-            // in the loop below by checking the flags column for \Seen.
+            // by checking the boolean "seen" column Lucee exposes per message.
+            // (Lucee returns individual boolean columns - seen, answered, deleted,
+            // draft, flagged, recent - not a combined flags string.)
             cfimap(
                 action     = "getHeaderOnly",
                 connection = "poll_#acct.id#",
@@ -371,29 +374,16 @@
             msgCount = qHeaders.recordCount;
             logLine("#msgCount# message(s) in mailbox (pre-seen-filter)");
 
-            // DIAGNOSTIC: log column names and uid=1 flags value so we can see
-            // exactly what cfimap getHeaderOnly returns. Remove after diagnosis.
-            logLine("DIAG qHeaders columns: #arrayToList(qHeaders.getColumnNames())#", "INFO");
-            if (msgCount GT 0) {
-                diagFlags = structKeyExists(qHeaders, "flags") ? qHeaders.flags[1] : "(flags column absent)";
-                diagFlagsHex = "";
-                for (diagI = 1; diagI LTE len(diagFlags); diagI++) {
-                    diagFlagsHex &= right("0" & formatBaseN(asc(mid(diagFlags, diagI, 1)), 16), 2) & " ";
-                }
-                logLine("DIAG uid=#qHeaders.uid[1]# flags=[#diagFlags#] hex=[#trim(diagFlagsHex)#] SEEN_FLAG hex=[5c 53 65 65 6e]", "INFO");
-            }
-
             for (msgIdx = 1; msgIdx LTE msgCount; msgIdx++) {
 
                 try {
                     msgUID     = qHeaders.uid[msgIdx];
                     msgSubject = qHeaders.subject[msgIdx];
 
-                    // Skip messages already marked \Seen.
-                    // SEEN_FLAG = chr(92) & "Seen" — do not use "\Seen" literal,
-                    // Lucee drops the backslash as an escape sequence.
-                    msgFlags = structKeyExists(qHeaders, "flags") ? qHeaders.flags[msgIdx] : "";
-                    if (findNoCase(SEEN_FLAG, msgFlags)) {
+                    // Skip messages already marked as seen.
+                    // Lucee cfimap exposes this as a boolean "seen" column,
+                    // not as a "\Seen" flag string.
+                    if (qHeaders.seen[msgIdx]) {
                         totalSkip++;
                         continue;
                     }
