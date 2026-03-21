@@ -338,12 +338,14 @@
                 timeout    = 60
             );
 
+            <!--- Bug 1 fix: messageType="unread" limits fetch to unseen messages only --->
             cfimap(
-                action     = "getHeaderOnly",
-                connection = "poll_#acct.id#",
-                folder     = mailbox,
-                name       = "qHeaders",
-                maxRows    = application.poller.batchSize
+                action      = "getHeaderOnly",
+                connection  = "poll_#acct.id#",
+                folder      = mailbox,
+                name        = "qHeaders",
+                maxRows     = application.poller.batchSize,
+                messageType = "unread"
             );
 
             msgCount = qHeaders.recordCount;

@@ -34,6 +34,8 @@
         - Unquoted struct keys with underscores get uppercased/mangled by Lucee;
           token refresh POST uses explicit cfhttpparam calls instead of a struct
         - Struct keys used as cfhttpparam names are quoted strings to be safe
+        - serializeJSON() uppercases all struct keys, breaking camelCase JSON keys
+          required by external APIs; use string literals for those payloads
 
       Gmail payload shapes observed in the wild:
         A) multipart/* — payload.parts[] array, attachments inside parts
@@ -291,8 +293,14 @@
     // markGmailMessage(accessToken, gmailMsgId, markRead, deleteMsg)
     //
     // Applies disposition to a Gmail message after successful processing.
-    // markRead  — removes UNREAD label
+    // markRead  — removes UNREAD label via the Gmail modify endpoint
     // deleteMsg — moves to TRASH (Gmail doesn't hard-delete via API)
+    //
+    // Bug fix: do NOT use serializeJSON() to build the modify request body.
+    // Lucee's serializeJSON() uppercases all struct keys, so
+    // {removeLabelIds:["UNREAD"]} becomes {"REMOVELABELIDS":["UNREAD"]},
+    // which the Gmail API ignores silently.  Use a hardcoded JSON string
+    // literal instead to guarantee the correct camelCase key.
     // -----------------------------------------------------------------------
     function markGmailMessage(
         required string  accessToken,
@@ -311,7 +319,12 @@
                 }
             } else if (arguments.markRead) {
                 var modEndpoint = "https://gmail.googleapis.com/gmail/v1/users/me/messages/#arguments.gmailMsgId#/modify";
-                var modBody     = serializeJSON({ removeLabelIds: ["UNREAD"] });
+                <!---
+                    Hardcoded JSON string — do NOT replace with serializeJSON().
+                    Lucee uppercases struct keys, producing {"REMOVELABELIDS":["UNREAD"]}
+                    which the Gmail API ignores.  The literal string below is correct.
+                --->
+                var modBody = '{"removeLabelIds":["UNREAD"]}';
                 cfhttp(url=modEndpoint, method="POST", result="modResp", timeout=15) {
                     cfhttpparam(type="header", name="Authorization",  value="Bearer #arguments.accessToken#");
                     cfhttpparam(type="header", name="Content-Type",   value="application/json");
