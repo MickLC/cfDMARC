@@ -137,8 +137,9 @@
 
     // -------------------------------------------------------------------
     // Insert report header
-    // INSERT IGNORE silently skips duplicate (domain, reportid) combos —
-    // which happen when multiple emails carry the same DMARC report.
+    // INSERT IGNORE silently skips duplicate (domain, reportid) rows.
+    // MariaDB does NOT populate generatedKey when a row is skipped — the
+    // key is absent entirely, not set to 0 — so we guard with structKeyExists.
     // -------------------------------------------------------------------
     queryExecute(
         "INSERT IGNORE INTO report
@@ -170,8 +171,8 @@
         { datasource: application.db.dsn, result: "insertResult" }
     );
 
-    // INSERT IGNORE returns generatedKey=0 when the row was skipped
-    newReportId = insertResult.generatedKey;
+    // generatedKey is absent (not 0) when INSERT IGNORE skips a duplicate
+    newReportId = structKeyExists(insertResult, "generatedKey") ? insertResult.generatedKey : 0;
     if (NOT val(newReportId)) {
         logLine("  RUA: duplicate report skipped (domain=#pDomain# reportId=#left(reportId,40)#)");
         return;
