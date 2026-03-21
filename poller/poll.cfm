@@ -11,11 +11,13 @@
 
       Architecture:
         Password accounts (local Dovecot):
-          - cfimap getHeaderOnly  : list messages, get UIDs and Message-IDs for dedup
-                                    exposes seen/answered/deleted/draft/flagged/recent
-                                    as individual boolean columns (not a flags string)
-          - doveadm fetch         : retrieve hdr + body per UID (fields: "hdr body")
-          - doveadm flags add     : mark \Seen (cfimap markRead silently fails on Dovecot)
+          - doveadm search UNSEEN : get UIDs of unseen messages (avoids cfimap
+                                    maxRows pagination problem — cfimap always
+                                    returns the first N messages, not the first N
+                                    unseen ones)
+          - cfimap getHeaderOnly  : fetch headers for specific unseen UIDs only
+          - doveadm fetch         : retrieve hdr + body per UID
+          - doveadm flags add     : mark \Seen after processing
           - extractDmarcAttachment: parse raw MIME body, locate ZIP/GZ/XML part,
                                     base64-decode only the attachment payload
           - extractXmlFromBytes   : decompress ZIP/GZ in parse_rua.cfm
@@ -93,6 +95,42 @@
                        folder=arguments.mailbox, uid=arguments.uid);
             } catch(any e) {}
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // getUnseenUids(username, mailbox, maxCount)
+    //
+    // Uses doveadm search to return an array of UID strings for unseen messages,
+    // limited to maxCount. This is the correct way to find unread messages in
+    // Lucee/Dovecot: cfimap getHeaderOnly with maxRows always returns the first
+    // N messages regardless of seen status, so it can never page past a block
+    // of already-seen messages at the start of the mailbox.
+    // -----------------------------------------------------------------------
+    function getUnseenUids(required string username, required string mailbox, required numeric maxCount) {
+        var searchOut = "";
+        var uids      = [];
+        try {
+            cfexecute(
+                name               = "/usr/bin/doveadm",
+                arguments          = "search -u #arguments.username# mailbox #arguments.mailbox# UNSEEN",
+                variable           = "searchOut",
+                timeout            = 30,
+                terminateOnTimeout = false
+            );
+        } catch(any e) {
+            logLine("  getUnseenUids: doveadm search error: #e.message#", "WARN");
+            return uids;
+        }
+        // doveadm search returns "mailboxId uid" pairs, one per line.
+        // We only need the uid (second token on each line).
+        for (var line in listToArray(trim(searchOut), chr(10))) {
+            line = trim(reReplace(line, chr(13), "", "ALL"));
+            if (NOT len(line)) continue;
+            var tokens = listToArray(line, " ");
+            if (arrayLen(tokens) GTE 2) arrayAppend(uids, tokens[2]);
+            if (arrayLen(uids) GTE arguments.maxCount) break;
+        }
+        return uids;
     }
 
     // -----------------------------------------------------------------------
@@ -251,9 +289,9 @@
     // fetchViaDoveadm - retrieve raw hdr + body for one UID via doveadm.
     //
     // doveadm exits non-zero when a UID no longer exists (deleted between
-    // cfimap listing and the doveadm call). We omit errorvariable to avoid
-    // Lucee scope issues, use terminateOnTimeout=false to suppress throws,
-    // and treat empty output as a soft skip.
+    // search and fetch). We omit errorvariable to avoid Lucee scope issues,
+    // use terminateOnTimeout=false to suppress throws, and treat empty output
+    // as a soft skip.
     // -----------------------------------------------------------------------
     function fetchViaDoveadm(required string username, required string mailbox, required string uid) {
         var result   = { body:"", headers:"", contentType:"", messageId:"" };
@@ -344,9 +382,31 @@
                 continue;
             }
 
-            mailbox      = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
-            imapPassword = decryptValue(acct.password);
+            mailbox = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
 
+            // Get UIDs of unseen messages via doveadm search.
+            // We do NOT use cfimap getHeaderOnly with a seen-filter because
+            // cfimap maxRows always returns the first N messages in the mailbox
+            // regardless of seen status — it cannot page past a block of
+            // already-seen messages at the start of the mailbox.
+            unseenUids = getUnseenUids(acct.username, mailbox, application.poller.batchSize);
+            msgCount   = arrayLen(unseenUids);
+            logLine("#msgCount# unseen message(s) in mailbox");
+
+            if (msgCount EQ 0) {
+                queryExecute(
+                    "UPDATE imap_accounts SET last_polled=NOW(), last_status=? WHERE id=?",
+                    [
+                        {value:"OK: 0 unseen", cfsqltype:"cf_sql_varchar"},
+                        {value:acct.id,        cfsqltype:"cf_sql_integer"}
+                    ],
+                    {datasource:application.db.dsn}
+                );
+                continue;
+            }
+
+            // Open IMAP connection - needed for cfimap getHeaderOnly per-UID
+            imapPassword = decryptValue(acct.password);
             cfimap(
                 action     = "open",
                 connection = "poll_#acct.id#",
@@ -358,38 +418,23 @@
                 timeout    = 60
             );
 
-            // Lucee's cfimap does not support messageType="unread" (ColdFusion-only).
-            // Fetch all headers up to batchSize, then skip already-seen messages
-            // by checking the boolean "seen" column Lucee exposes per message.
-            // (Lucee returns individual boolean columns - seen, answered, deleted,
-            // draft, flagged, recent - not a combined flags string.)
-            cfimap(
-                action     = "getHeaderOnly",
-                connection = "poll_#acct.id#",
-                folder     = mailbox,
-                name       = "qHeaders",
-                maxRows    = application.poller.batchSize
-            );
-
-            msgCount = qHeaders.recordCount;
-            logLine("#msgCount# message(s) in mailbox (pre-seen-filter)");
-
-            for (msgIdx = 1; msgIdx LTE msgCount; msgIdx++) {
+            for (msgUID in unseenUids) {
 
                 try {
-                    msgUID     = qHeaders.uid[msgIdx];
-                    msgSubject = qHeaders.subject[msgIdx];
+                    // Fetch header for this specific UID to get Message-ID for dedup.
+                    // uid attribute on cfimap getHeaderOnly fetches exactly one message.
+                    cfimap(
+                        action     = "getHeaderOnly",
+                        connection = "poll_#acct.id#",
+                        folder     = mailbox,
+                        name       = "qOneHeader",
+                        uid        = msgUID
+                    );
 
-                    // Skip messages already marked as seen.
-                    // Lucee cfimap exposes this as a boolean "seen" column,
-                    // not as a "\Seen" flag string.
-                    if (qHeaders.seen[msgIdx]) {
-                        totalSkip++;
-                        continue;
-                    }
+                    msgSubject = qOneHeader.recordCount ? qOneHeader.subject[1] : "";
 
-                    // Quick dedup via Message-ID from cfimap header (avoids doveadm round-trip)
-                    rawHdr     = qHeaders.header[msgIdx];
+                    // Quick dedup via Message-ID (avoids doveadm fetch round-trip)
+                    rawHdr     = qOneHeader.recordCount ? qOneHeader.header[1] : "";
                     midMatch   = reFind("(?i)Message-ID:\s*([^\r\n]+)", rawHdr, 1, true);
                     quickMsgId = "";
                     if (midMatch.len[1] GT 0 AND arrayLen(midMatch.len) GT 1)
@@ -409,11 +454,8 @@
 
                     fetched      = fetchViaDoveadm(acct.username, mailbox, msgUID);
                     contentType  = fetched.contentType;
-                    msgBody      = "";
                     attachments  = [];
                     msgMessageId = len(fetched.messageId) ? fetched.messageId : (len(quickMsgId) ? quickMsgId : createUUID());
-
-                    rawBytes = javaCast("null","");
 
                     if (len(trim(fetched.body))) {
                         try {
@@ -427,7 +469,7 @@
                             logLine("  uid=#msgUID# extract error: #decErr.message#", "WARN");
                         }
                     } else {
-                        // doveadm returned nothing - UID was deleted after cfimap listed it
+                        // doveadm returned nothing - UID was deleted after search
                         totalSkip++;
                         continue;
                     }
@@ -435,7 +477,7 @@
                     cleanMsgId = reReplace(trim(msgMessageId), "[<>\s]", "", "ALL");
                     if (NOT len(cleanMsgId)) cleanMsgId = createUUID();
 
-                    // Final dedup on full Message-ID (catches cases where quickMsgId was empty)
+                    // Final dedup on full Message-ID
                     qDupe = queryExecute("SELECT id FROM report WHERE message_id=? LIMIT 1",
                         [{value:cleanMsgId, cfsqltype:"cf_sql_varchar"}],
                         {datasource:application.db.dsn});
@@ -458,7 +500,7 @@
                         include "/poller/parse_rua.cfm";
                     }
 
-                    // Only dispose after confirmed DB write (parse_rua/ruf succeeded)
+                    // Only dispose after confirmed DB write
                     disposeMessage(acct.username, mailbox, msgUID);
                     totalNew++;
 
@@ -474,7 +516,7 @@
             queryExecute(
                 "UPDATE imap_accounts SET last_polled=NOW(), last_status=? WHERE id=?",
                 [
-                    {value:"OK: #msgCount# checked, #totalNew# new", cfsqltype:"cf_sql_varchar"},
+                    {value:"OK: #msgCount# unseen checked, #totalNew# new", cfsqltype:"cf_sql_varchar"},
                     {value:acct.id, cfsqltype:"cf_sql_integer"}
                 ],
                 {datasource:application.db.dsn}
