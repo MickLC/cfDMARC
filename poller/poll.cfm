@@ -3,10 +3,9 @@
 
       Access control: caller must supply ?token= matching application.poller.token.
 
-      Uses Jakarta Mail (jakarta.mail) loaded explicitly from Lucee's own JAR,
-      preventing the javax.mail/jakarta.mail classloader conflict.
-      cfimap getAll silently discards inline MIME parts (no Content-Disposition:attachment)
-      which is how Google sends DMARC reports. Jakarta Mail gives us every part reliably.
+      Uses Jakarta Mail (jakarta.mail) via plain createObject - Lucee registers
+      the service provider correctly when loaded this way. Loading from an explicit
+      JAR path bypasses the SPI service loader and breaks StreamProvider.
 --->
 <cfinclude template="/includes/functions.cfm">
 
@@ -25,10 +24,6 @@
     totalNew   = 0;
     totalSkip  = 0;
     totalError = 0;
-
-    // Jakarta Mail JAR — load explicitly so Lucee's classloader is used,
-    // preventing the javax.mail vs jakarta.mail classloader conflict.
-    MAIL_JAR = "/opt/lucee/tomcat/lucee-server/mvn/com/sun/mail/jakarta.mail/2.0.2/jakarta.mail-2.0.2.jar";
 
     function logLine(required string msg, string level="INFO") {
         var ts = dateTimeFormat(now(), "yyyy-mm-dd HH:nn:ss");
@@ -52,6 +47,8 @@
 
     // Walk a MIME Part recursively via Jakarta Mail.
     // Collects every binary part regardless of Content-Disposition.
+    // Uses className string check instead of isInstanceOf to avoid
+    // cross-classloader instanceof failures.
     // Returns struct { attachments: [], body: "" }
     function walkPart(required any part) {
         var result = { attachments: [], body: "" };
@@ -63,7 +60,6 @@
         var isBinary = reFindNoCase(
             "(application/zip|application/gzip|application/x-gzip|application/octet-stream|text/xml|application/xml)", ct);
 
-        // Collect as attachment if: marked ATTACHMENT, or binary content type
         if (disp EQ "ATTACHMENT" OR isBinary) {
             var fname = "";
             try { fname = javaCast("string", arguments.part.getFileName() ?: ""); } catch(any e) {}
@@ -75,10 +71,8 @@
             return result;
         }
 
-        // Recurse into any Multipart content
         try {
-            var content = arguments.part.getContent();
-            // Check class name rather than instanceof to avoid classloader issues
+            var content   = arguments.part.getContent();
             var className = content.getClass().getName();
             if (findNoCase("Multipart", className)) {
                 for (var i = 0; i LT content.getCount(); i++) {
@@ -88,7 +82,6 @@
                 }
                 return result;
             }
-            // Leaf text content
             if (reFindNoCase("text/(plain|html)", ct)) {
                 result.body = javaCast("string", content ?: "");
             }
@@ -179,7 +172,6 @@
             mailbox  = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
             protocol = acct.use_ssl ? "imaps" : "imap";
 
-            // Load Session from the explicit JAR to use Lucee's classloader
             props = createObject("java","java.util.Properties").init();
             props.setProperty("mail.store.protocol", protocol);
             props.setProperty("mail.#protocol#.host", acct.host);
@@ -197,11 +189,12 @@
                 connectPassword = imapPassword;
             }
 
-            jSession   = createObject("java", "jakarta.mail.Session", MAIL_JAR).getInstance(props);
+            // Plain createObject — Lucee's service loader registers StreamProvider correctly
+            jSession   = createObject("java","jakarta.mail.Session").getInstance(props);
             imapStore  = jSession.getStore(protocol);
             imapStore.connect(acct.host, acct.username, connectPassword);
             imapFolder = imapStore.getFolder(mailbox);
-            imapFolder.open(javaCast("int", 2)); // Folder.READ_WRITE = 2
+            imapFolder.open(javaCast("int", 2)); // READ_WRITE = 2
 
             jMessages = imapFolder.getMessages();
             msgCount  = arrayLen(jMessages);
@@ -239,10 +232,10 @@
                     if (qDupe.recordCount) {
                         logLine("  Duplicate — skipping");
                         totalSkip++;
-                        if (application.poller.markAsRead)
-                            jMsg.setFlag(
-                                createObject("java","jakarta.mail.Flags$Flag", MAIL_JAR).SEEN,
-                                javaCast("boolean", true));
+                        if (application.poller.markAsRead) {
+                            var seenFlag = createObject("java","jakarta.mail.Flags$Flag").SEEN;
+                            jMsg.setFlag(seenFlag, javaCast("boolean", true));
+                        }
                         continue;
                     }
 
@@ -258,10 +251,10 @@
                         include "/poller/parse_rua.cfm";
                     }
 
-                    if (application.poller.markAsRead)
-                        jMsg.setFlag(
-                            createObject("java","jakarta.mail.Flags$Flag", MAIL_JAR).SEEN,
-                            javaCast("boolean", true));
+                    if (application.poller.markAsRead) {
+                        var seenFlag = createObject("java","jakarta.mail.Flags$Flag").SEEN;
+                        jMsg.setFlag(seenFlag, javaCast("boolean", true));
+                    }
 
                     totalNew++;
 
