@@ -53,24 +53,21 @@
     // Returns: byte array, or javaCast("null","") if nothing usable found.
     //
     // Strategy:
-    //   1. Extract boundary from top-level Content-Type header.
-    //   2. Split body on boundary; iterate parts.
+    //   1. Check top-level Content-Type: if it IS application/zip|gzip|octet-stream,
+    //      the entire body is the base64 payload (Google-style single-part message).
+    //      Decode directly.
+    //   2. If top-level Content-Type is multipart/*, extract boundary and split.
     //   3. For each part: parse part headers, look for attachment-like
-    //      Content-Type (zip/gz/octet-stream) or filename (*.zip/*.gz/*.xml).
+    //      Content-Type or filename (*.zip/*.gz/*.xml).
     //   4. If part is itself multipart, recurse one level.
-    //   5. If the selected part uses Content-Transfer-Encoding: base64,
-    //      strip whitespace and decode.
-    //   6. Fallback: if no boundary found, try decoding the whole body
-    //      as flat base64 (some non-MIME senders).
+    //   5. Fallback: try decoding the whole body as flat base64.
     // -----------------------------------------------------------------------
     function extractDmarcAttachment(required string mimeBody, required string topHeaders) {
-        var NL     = chr(10);
-        var CRLF   = chr(13) & chr(10);
 
         // ---- helper: parse header block into a struct (lowercased names) ----
+        // Handles RFC 2822 folded headers (continuation lines starting with whitespace)
         function parseHeaders(required string hdrs) {
             var result = {};
-            // Unfold RFC 2822 folded headers (CRLF/LF followed by whitespace)
             var unfolded = reReplace(arguments.hdrs, "(#chr(13)##chr(10)#|#chr(10)#)[ #chr(9)#]+", " ", "ALL");
             for (var line in listToArray(unfolded, chr(10))) {
                 line = reReplace(line, chr(13), "", "ALL");
@@ -94,36 +91,26 @@
 
         // ---- helper: is this Content-Type or filename a DMARC attachment? ----
         function isDmarcPart(required string ct, required string filename) {
-            var lct  = lCase(arguments.ct);
-            var lfn  = lCase(arguments.filename);
-            if (reFindNoCase("application/(zip|gzip|x-zip|x-zip-compressed|x-gzip|octet-stream)", lct)) return true;
-            if (reFindNoCase("\.xml(\.gz|\.zip)?$", lfn)) return true;
-            if (reFindNoCase("\.(gz|zip)$", lfn)) return true;
+            if (reFindNoCase("application/(zip|gzip|x-zip|x-zip-compressed|x-gzip|octet-stream)", arguments.ct)) return true;
+            if (reFindNoCase("\.xml(\.gz|\.zip)?$", arguments.filename)) return true;
+            if (reFindNoCase("\.(gz|zip)$", arguments.filename)) return true;
             return false;
         }
 
         // ---- helper: extract filename from Content-Disposition or Content-Type ----
         function getFilename(required string cdValue, required string ctValue) {
-            var m = reFind("(?i)filename=[""']?([^""';\r\n]+)[""']?", arguments.cdValue & " " & arguments.ctValue, 1, true);
+            var combined = arguments.cdValue & " " & arguments.ctValue;
+            var m = reFind("(?i)filename=[""']?([^""';\r\n]+)[""']?", combined, 1, true);
             if (m.len[1] GT 0 AND arrayLen(m.len) GT 1)
-                return trim(reReplace(mid(arguments.cdValue & " " & arguments.ctValue, m.pos[2], m.len[2]), "[""']", "", "ALL"));
+                return trim(reReplace(mid(combined, m.pos[2], m.len[2]), "[""']", "", "ALL"));
             return "";
         }
 
-        // ---- helper: base64-decode a MIME part payload ----
-        function decodePartPayload(required string payload, required string cte) {
-            if (lCase(trim(arguments.cte)) EQ "base64") {
-                var clean = reReplace(arguments.payload, "\s+", "", "ALL");
-                if (NOT len(clean)) return javaCast("null","");
-                return createObject("java","java.util.Base64").getDecoder().decode(clean);
-            } else if (lCase(trim(arguments.cte)) EQ "quoted-printable") {
-                // Unlikely for binary attachments but handle gracefully
-                var raw = reReplace(arguments.payload, "=[\r\n]+", "", "ALL");
-                return raw.getBytes("ISO-8859-1");
-            } else {
-                // 7bit / 8bit / binary — treat as raw bytes
-                return arguments.payload.getBytes("ISO-8859-1");
-            }
+        // ---- helper: base64-decode a MIME part payload to byte array ----
+        function decodeBase64Payload(required string payload) {
+            var clean = reReplace(arguments.payload, "\s+", "", "ALL");
+            if (NOT len(clean)) return javaCast("null","");
+            return createObject("java","java.util.Base64").getDecoder().decode(clean);
         }
 
         // ---- helper: process an array of MIME parts, return first DMARC attachment bytes ----
@@ -132,32 +119,31 @@
                 rawPart = trim(rawPart);
                 if (NOT len(rawPart)) continue;
 
-                // Split part headers from part body (blank line separator)
-                // Handle both CRLF and LF line endings
-                var splitPos = 0;
+                // Split part headers from part body on first blank line
+                var splitPos  = 0;
                 var crlfBlank = find(chr(13) & chr(10) & chr(13) & chr(10), rawPart);
                 var lfBlank   = find(chr(10) & chr(10), rawPart);
                 if (crlfBlank GT 0)
-                    splitPos = crlfBlank + 3;  // skip past CRLFCRLF
+                    splitPos = crlfBlank + 4;   // position of first char after CRLFCRLF
                 else if (lfBlank GT 0)
-                    splitPos = lfBlank + 1;    // skip past LFLF
+                    splitPos = lfBlank + 2;     // position of first char after LFLF
 
-                if (splitPos EQ 0) continue;  // malformed part
+                if (splitPos EQ 0) continue;
 
-                var partHdrBlock = left(rawPart, splitPos);
-                var partBody     = mid(rawPart, splitPos + 1, len(rawPart));
+                var partHdrBlock = left(rawPart, splitPos - 1);
+                var partBody     = mid(rawPart, splitPos, len(rawPart));
 
                 var ph  = parseHeaders(partHdrBlock);
-                var pct = structKeyExists(ph, "content-type")        ? ph["content-type"]         : "";
-                var pcd = structKeyExists(ph, "content-disposition")  ? ph["content-disposition"]  : "";
+                var pct = structKeyExists(ph, "content-type")              ? ph["content-type"]              : "";
+                var pcd = structKeyExists(ph, "content-disposition")       ? ph["content-disposition"]       : "";
                 var pte = structKeyExists(ph, "content-transfer-encoding") ? ph["content-transfer-encoding"] : "7bit";
                 var pfn = getFilename(pcd, pct);
 
-                // Nested multipart? Recurse one level.
+                // Nested multipart — recurse one level
                 if (reFindNoCase("^multipart/", pct)) {
                     var innerBoundary = getBoundary(pct);
                     if (len(innerBoundary)) {
-                        var innerParts = listToArray(partBody, "--" & innerBoundary);
+                        var innerParts  = listToArray(partBody, "--" & innerBoundary);
                         var innerResult = processParts(innerParts);
                         if (NOT isNull(innerResult)) return innerResult;
                     }
@@ -165,11 +151,17 @@
                 }
 
                 if (isDmarcPart(pct, pfn)) {
-                    try {
-                        var decoded = decodePartPayload(trim(partBody), pte);
-                        if (NOT isNull(decoded) AND arrayLen(decoded) GT 4) return decoded;
-                    } catch(any e) {
-                        // Try next part
+                    if (lCase(trim(pte)) EQ "base64") {
+                        try {
+                            var decoded = decodeBase64Payload(partBody);
+                            if (NOT isNull(decoded) AND arrayLen(decoded) GT 4) return decoded;
+                        } catch(any e) { /* try next part */ }
+                    } else {
+                        // 7bit/8bit/binary — return raw bytes via ISO-8859-1 lossless mapping
+                        try {
+                            var rawB = partBody.getBytes("ISO-8859-1");
+                            if (arrayLen(rawB) GT 4) return rawB;
+                        } catch(any e) {}
                     }
                 }
             }
@@ -179,29 +171,48 @@
         // ================================================================
         // Main logic
         // ================================================================
-
-        // Extract top-level Content-Type and boundary
-        var topHdrs  = parseHeaders(arguments.topHeaders);
-        var topCT    = structKeyExists(topHdrs, "content-type") ? topHdrs["content-type"] : "";
+        var topHdrs = parseHeaders(arguments.topHeaders);
+        var topCT   = structKeyExists(topHdrs, "content-type")              ? topHdrs["content-type"]              : "";
+        var topCTE  = structKeyExists(topHdrs, "content-transfer-encoding") ? topHdrs["content-transfer-encoding"] : "7bit";
+        var topCD   = structKeyExists(topHdrs, "content-disposition")       ? topHdrs["content-disposition"]       : "";
+        var topFN   = getFilename(topCD, topCT);
         var boundary = getBoundary(topCT);
 
+        logLine("  MIME debug: topCT=[#left(topCT,80)#] boundary=[#boundary#] bodyLen=#len(arguments.mimeBody)#", "INFO");
+
+        // Path 1: Top-level Content-Type IS the attachment (Google single-part style)
+        // e.g. Content-Type: application/zip  with Content-Transfer-Encoding: base64
+        if (isDmarcPart(topCT, topFN) AND NOT len(boundary)) {
+            logLine("  MIME path: single-part attachment, CTE=#topCTE#", "INFO");
+            if (lCase(trim(topCTE)) EQ "base64") {
+                try {
+                    var decoded = decodeBase64Payload(arguments.mimeBody);
+                    if (NOT isNull(decoded) AND arrayLen(decoded) GT 4) return decoded;
+                } catch(any e) {
+                    logLine("  MIME path 1 decode error: #e.message#", "WARN");
+                }
+            } else {
+                try {
+                    var rawB = arguments.mimeBody.getBytes("ISO-8859-1");
+                    if (arrayLen(rawB) GT 4) return rawB;
+                } catch(any e) {}
+            }
+        }
+
+        // Path 2: Multipart — find the attachment part
         if (len(boundary)) {
-            // Multipart message: split and process parts
-            // listToArray on "--boundary" handles the preamble and epilogue naturally
-            var parts = listToArray(arguments.mimeBody, "--" & boundary);
+            logLine("  MIME path: multipart, boundary=#boundary#", "INFO");
+            var parts  = listToArray(arguments.mimeBody, "--" & boundary);
             var result = processParts(parts);
             if (NOT isNull(result)) return result;
         }
 
-        // Fallback: try treating the whole body as a flat base64 blob.
-        // Some simple senders attach the ZIP directly as the sole body part.
+        // Path 3: Fallback — try treating entire body as flat base64
+        logLine("  MIME path: fallback flat-base64 (bodyLen=#len(arguments.mimeBody)#)", "WARN");
         try {
-            var clean = reReplace(trim(arguments.mimeBody), "\s+", "", "ALL");
-            if (len(clean) GT 20) {
-                var decoded = createObject("java","java.util.Base64").getDecoder().decode(clean);
-                if (NOT isNull(decoded) AND arrayLen(decoded) GT 4) return decoded;
-            }
-        } catch(any e) { /* not a flat base64 blob */ }
+            var decoded = decodeBase64Payload(arguments.mimeBody);
+            if (NOT isNull(decoded) AND arrayLen(decoded) GT 4) return decoded;
+        } catch(any e) { /* not decodable */ }
 
         return javaCast("null","");
     }
@@ -210,11 +221,9 @@
     // fetchViaDoveadm  — retrieve raw hdr + body for one message UID
     // -----------------------------------------------------------------------
     function fetchViaDoveadm(required string username, required string mailbox, required string uid) {
-        var result = { body:"", headers:"", contentType:"", messageId:"" };
-
-        // param fetchErr so the len(trim()) check below never throws when
-        // doveadm produces no stderr (Lucee only sets errorvariable on actual output)
-        param name="fetchErr" default="";
+        var result    = { body:"", headers:"", contentType:"", messageId:"" };
+        var fetchOut  = "";
+        var fetchErr  = "";   // var-scoped so it exists even when doveadm writes nothing to stderr
 
         cfexecute(
             name          = "/usr/bin/doveadm",
@@ -227,16 +236,19 @@
         if (len(trim(fetchErr))) {
             logLine("  doveadm stderr uid=#arguments.uid#: #left(fetchErr,300)#", "WARN");
         }
+        if (NOT len(trim(fetchOut))) {
+            // doveadm returned nothing — UID likely deleted between cfimap listing and now
+            logLine("  doveadm returned empty output uid=#arguments.uid# (message gone?)", "WARN");
+            return result;
+        }
 
-        // doveadm output format for multiple fields:
-        //   hdr:
-        //   <header text>
-        //   body:
-        //   <raw MIME body>
+        // doveadm "hdr body" output format:
+        //   hdr:\n<headers>\nbody:\n<raw MIME body>
         //
-        // Note: for multipart messages the body section contains the full MIME
-        // structure (boundary markers, part headers, base64 payloads, etc.).
-        // Do NOT try to base64-decode the whole body — use extractDmarcAttachment().
+        // For a single-part message (e.g. Google DMARC reports), the body section
+        // is the base64-encoded attachment directly.
+        // For multipart messages, the body section is the full MIME body with
+        // boundary markers and per-part headers embedded.
         var hdrStart  = reFindNoCase("(?m)^hdr:\s*$",  fetchOut);
         var bodyStart = reFindNoCase("(?m)^body:\s*$", fetchOut);
 
@@ -251,19 +263,20 @@
 
         if (bodyStart GT 0) {
             var afterBodyLabel = bodyStart + len(reMatch("(?m)^body:\s*$\n?", fetchOut)[1]);
+            // Do NOT trim() the body — extractDmarcAttachment handles whitespace internally
             result.body = mid(fetchOut, afterBodyLabel, len(fetchOut) - afterBodyLabel + 1);
-            // Note: intentionally NOT trim()ing body — leading whitespace can matter for MIME parsing
         }
 
-        // Extract Content-Type from headers
-        var ctMatch = reFind("(?i)Content-Type:\s*([^\r\n]+)", result.headers, 1, true);
+        // Extract Content-Type from headers (may be folded — unfold first)
+        var unfolded = reReplace(result.headers, "(#chr(13)##chr(10)#|#chr(10)#)[ #chr(9)#]+", " ", "ALL");
+        var ctMatch = reFind("(?i)Content-Type:\s*([^\r\n]+)", unfolded, 1, true);
         if (ctMatch.len[1] GT 0 AND arrayLen(ctMatch.len) GT 1)
-            result.contentType = trim(mid(result.headers, ctMatch.pos[2], ctMatch.len[2]));
+            result.contentType = trim(mid(unfolded, ctMatch.pos[2], ctMatch.len[2]));
 
         // Extract Message-ID from headers
-        var midMatch = reFind("(?i)Message-ID:\s*([^\r\n]+)", result.headers, 1, true);
+        var midMatch = reFind("(?i)Message-ID:\s*([^\r\n]+)", unfolded, 1, true);
         if (midMatch.len[1] GT 0 AND arrayLen(midMatch.len) GT 1)
-            result.messageId = trim(mid(result.headers, midMatch.pos[2], midMatch.len[2]));
+            result.messageId = trim(mid(unfolded, midMatch.pos[2], midMatch.len[2]));
 
         return result;
     }
@@ -271,7 +284,7 @@
     // -----------------------------------------------------------------------
     // Main poll loop
     // -----------------------------------------------------------------------
-    logLine("=== Poll run started ===");
+    logLine("=== Poll run started (v2) ===");
 
     qAccounts = queryExecute(
         "SELECT id, label, host, port, username,
@@ -355,17 +368,22 @@
                     msgMessageId = len(fetched.messageId) ? fetched.messageId : (len(quickMsgId) ? quickMsgId : createUUID());
 
                     // Extract the DMARC attachment from the raw MIME body.
-                    // extractDmarcAttachment() handles multipart parsing and base64 decoding.
+                    // extractDmarcAttachment() handles both single-part (Google-style)
+                    // and multipart messages, and base64-decodes the attachment payload.
                     if (len(trim(fetched.body))) {
                         try {
                             rawBytes = extractDmarcAttachment(fetched.body, fetched.headers);
                             if (NOT isNull(rawBytes) AND arrayLen(rawBytes) GT 4) {
                                 attachments = [{ name: "report", bytes: rawBytes }];
                                 logLine("  uid=#msgUID# decoded #arrayLen(rawBytes)# bytes from body");
+                            } else {
+                                logLine("  uid=#msgUID# extractDmarcAttachment returned null/empty", "WARN");
                             }
                         } catch(any decErr) {
-                            logLine("  uid=#msgUID# attachment extract error: #decErr.message#", "WARN");
+                            logLine("  uid=#msgUID# attachment extract error: #decErr.message# | #decErr.detail#", "WARN");
                         }
+                    } else {
+                        logLine("  uid=#msgUID# fetched.body is empty", "WARN");
                     }
 
                     cleanMsgId = reReplace(trim(msgMessageId), "[<>\s]", "", "ALL");
