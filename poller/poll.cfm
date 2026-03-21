@@ -205,22 +205,32 @@
     //   "hdr:" followed by a newline
     //   "body:" followed by a newline
     //
-    // We find these with a simple string search across all four CRLF/LF
-    // combinations rather than a regex, which is unreliable with mixed
-    // line endings in Lucee's POSIX regex engine.
+    // We find these with a simple string search rather than a regex, which
+    // is unreliable with mixed line endings in Lucee's POSIX regex engine.
+    //
+    // cfexecute throws (rather than populating errorvariable) when doveadm
+    // exits non-zero — e.g. when a UID was deleted between cfimap listing
+    // and the doveadm call. We catch that and return an empty result so the
+    // caller can skip the message cleanly without a hard error.
     // -----------------------------------------------------------------------
     function fetchViaDoveadm(required string username, required string mailbox, required string uid) {
         var result   = { body:"", headers:"", contentType:"", messageId:"" };
         var fetchOut = "";
-        var fetchErr = "";   // var-declared so len(trim()) is always safe
+        var fetchErr = "";
 
-        cfexecute(
-            name          = "/usr/bin/doveadm",
-            arguments     = 'fetch -u #arguments.username# "hdr body" mailbox #arguments.mailbox# uid #arguments.uid#',
-            variable      = "fetchOut",
-            errorvariable = "fetchErr",
-            timeout       = 30
-        );
+        try {
+            cfexecute(
+                name          = "/usr/bin/doveadm",
+                arguments     = 'fetch -u #arguments.username# "hdr body" mailbox #arguments.mailbox# uid #arguments.uid#',
+                variable      = "fetchOut",
+                errorvariable = "fetchErr",
+                timeout       = 30
+            );
+        } catch(any execErr) {
+            // doveadm exited non-zero (message deleted, permission error, etc.)
+            logLine("  doveadm failed uid=#arguments.uid#: #execErr.message#", "WARN");
+            return result;
+        }
 
         if (len(trim(fetchErr))) {
             logLine("  doveadm stderr uid=#arguments.uid#: #left(fetchErr,300)#", "WARN");
@@ -231,15 +241,12 @@
         }
 
         // Locate section labels using literal string search.
-        // doveadm emits "hdr:\n" or "hdr:\r\n" as the first line,
-        // then headers, then "body:\n" or "body:\r\n", then the MIME body.
-        // We try both CRLF and LF variants.
+        // Try CRLF first, then LF.
         var hdrLabel  = "";
         var bodyLabel = "";
         var hdrPos    = 0;
         var bodyPos   = 0;
 
-        // Try CRLF first, then LF
         if (find("hdr:" & chr(13) & chr(10), fetchOut) GT 0) {
             hdrLabel  = "hdr:"  & chr(13) & chr(10);
             bodyLabel = "body:" & chr(13) & chr(10);
@@ -263,7 +270,7 @@
         if (bodyPos GT 0) {
             var bodyContentStart = bodyPos + len(bodyLabel);
             result.body = mid(fetchOut, bodyContentStart, len(fetchOut));
-            // Not trim()-ing: extractDmarcAttachment handles internal whitespace
+            // Not trim()-ing body: extractDmarcAttachment handles internal whitespace
         }
 
         logLine("  fetch: hdrLen=#len(result.headers)# bodyLen=#len(result.body)#");
@@ -285,7 +292,7 @@
     // -----------------------------------------------------------------------
     // Main poll loop
     // -----------------------------------------------------------------------
-    logLine("=== Poll run started (v3) ===");
+    logLine("=== Poll run started (v4) ===");
 
     qAccounts = queryExecute(
         "SELECT id, label, host, port, username,
@@ -368,9 +375,9 @@
                     attachments  = [];
                     msgMessageId = len(fetched.messageId) ? fetched.messageId : (len(quickMsgId) ? quickMsgId : createUUID());
 
-                    // Declare rawBytes cleanly each iteration — prevents stale value
-                    // from a prior iteration leaking into logging/processing.
-                    var rawBytes = javaCast("null","");
+                    // rawBytes must NOT use "var" here — var is only valid inside functions.
+                    // Initialize to null each iteration to prevent stale values from prior passes.
+                    rawBytes = javaCast("null","");
 
                     if (len(trim(fetched.body))) {
                         try {
