@@ -25,6 +25,9 @@
         oauth_token_expiry   — TIMESTAMP (local server time)
         oauth_client_id      — plaintext Google client ID
         oauth_client_secret  — AES-encrypted Google client secret
+
+      Lucee page-scope gotcha: do NOT use var declarations outside a function.
+      All variables in the main loop body are plain assignments.
 --->
 <cfscript>
 
@@ -34,8 +37,8 @@
     // GET https://gmail.googleapis.com/gmail/v1/users/me/{apiPath}
     // Returns deserialized JSON struct, or throws on HTTP error.
     //
-    // NOTE: local variable deliberately named apiEndpoint (not url) to avoid
-    // collision with Lucee's built-in URL scope inside cfhttp tag attributes.
+    // NOTE: local variable named apiEndpoint (not url) to avoid collision
+    // with Lucee's built-in URL scope inside cfhttp tag attributes.
     // -----------------------------------------------------------------------
     function gmailApiGet(
         required string accessToken,
@@ -149,7 +152,6 @@
         } else if (NOT isDate(acctRow.oauth_token_expiry)) {
             needRefresh = true;
         } else {
-            // Refresh if expiry is within 5 minutes
             var secsRemaining = dateDiff("s", now(), acctRow.oauth_token_expiry);
             if (secsRemaining LT 300) needRefresh = true;
         }
@@ -205,6 +207,10 @@
     // Recursively walks a Gmail message payload parts[] tree.
     // Returns array of byte arrays for any ZIP/GZ/XML/octet-stream parts.
     // Fetches large attachments by attachmentId if body.data is absent.
+    //
+    // Matching is intentionally broad: any part with a filename ending in
+    // .zip/.gz/.xml, or a DMARC-relevant MIME type, qualifies.  Google sends
+    // DMARC reports as application/zip with a .zip filename.
     // -----------------------------------------------------------------------
     function findAttachmentParts(
         required array  parts,
@@ -214,9 +220,8 @@
         var found = [];
 
         for (var part in arguments.parts) {
-            var mimeType = lCase(part.mimeType ?: "");
-            var filename = "";
-            if (structKeyExists(part, "filename")) filename = lCase(trim(part.filename));
+            var mimeType = lCase(trim(part.mimeType ?: ""));
+            var filename = lCase(trim(part.filename ?: ""));
 
             // Recurse into multipart containers
             if (left(mimeType, 10) EQ "multipart/") {
@@ -228,35 +233,46 @@
             }
 
             // Is this a DMARC attachment?
+            // Match on MIME type OR filename extension — whichever fires first.
             var isDmarc = false;
             if (reFindNoCase("application/(zip|gzip|x-zip|x-zip-compressed|x-gzip|octet-stream|xml)", mimeType)) isDmarc = true;
-            if (reFindNoCase("\.xml(\.gz|\.zip)?$", filename)) isDmarc = true;
-            if (reFindNoCase("\.(gz|zip|xml)$", filename)) isDmarc = true;
+            if (reFindNoCase("\.(zip|gz|xml)$", filename)) isDmarc = true;
 
-            if (NOT isDmarc) continue;
+            if (NOT isDmarc) {
+                // Log unrecognised parts at DEBUG level so we can diagnose misses
+                if (len(filename) OR len(mimeType))
+                    logLine("  Gmail: skipping part mime=#mimeType# file=#filename# msg=#arguments.gmailMsgId#", "INFO");
+                continue;
+            }
 
             var bodyBytes = javaCast("null", "");
 
             try {
                 if (structKeyExists(part, "body")) {
                     var body = part.body;
+                    var attachSize = val(body.size ?: 0);
 
-                    // Inline data
                     if (structKeyExists(body, "data") AND len(body.data)) {
+                        // Inline base64url data
                         bodyBytes = b64urlDecode(body.data);
 
-                    // Large attachment — fetch by attachmentId
                     } else if (structKeyExists(body, "attachmentId") AND len(body.attachmentId)) {
+                        // Large attachment — fetch separately by attachmentId
+                        logLine("  Gmail: fetching attachment id=#body.attachmentId# size=#attachSize# msg=#arguments.gmailMsgId#", "INFO");
                         var attData = gmailApiGet(
                             arguments.accessToken,
                             "messages/#arguments.gmailMsgId#/attachments/#body.attachmentId#"
                         );
                         if (structKeyExists(attData, "data") AND len(attData.data))
                             bodyBytes = b64urlDecode(attData.data);
+                        else
+                            logLine("  Gmail: attachment fetch returned no data id=#body.attachmentId#", "WARN");
+                    } else {
+                        logLine("  Gmail: DMARC part has no data and no attachmentId mime=#mimeType# file=#filename# msg=#arguments.gmailMsgId#", "WARN");
                     }
                 }
             } catch(any partErr) {
-                logLine("  Gmail: attachment decode error msg=#arguments.gmailMsgId#: #partErr.message#", "WARN");
+                logLine("  Gmail: attachment decode error msg=#arguments.gmailMsgId# mime=#mimeType#: #partErr.message#", "WARN");
             }
 
             if (NOT isNull(bodyBytes) AND arrayLen(bodyBytes) GT 4)
@@ -305,6 +321,9 @@
     // =======================================================================
     // Main Gmail fetch loop
     // Replaces the doveadm path for this account.
+    //
+    // IMPORTANT: No var declarations at page scope — Lucee only allows var
+    // inside functions. All loop variables are plain assignments.
     // =======================================================================
 
     // Load full OAuth2 token columns (poll.cfm's main query omits them for brevity)
@@ -339,9 +358,6 @@
             gmailToken = getValidAccessToken(gmailAcct);
 
             // Step 2: list unread messages in INBOX (batch-limited)
-            // q=in:inbox is:unread scopes to what we care about.
-            // If markAsRead=false we'll see the same messages repeatedly —
-            // deduplication via Message-ID in the DB handles that safely.
             gmailListParams = {
                 q          : "in:inbox is:unread",
                 maxResults : application.poller.batchSize
@@ -409,30 +425,36 @@
                             continue;
                         }
 
-                        // Step 5: collect attachment bytes from payload tree
-                        attachments = [];
+                        // Step 5: collect attachment bytes from payload tree.
+                        // No var declarations here — page scope, not function scope.
+                        attachments  = [];
+                        rawBytesList = [];
 
                         if (structKeyExists(gmailPayload, "parts") AND isArray(gmailPayload.parts) AND arrayLen(gmailPayload.parts)) {
-                            var rawBytesList = findAttachmentParts(gmailPayload.parts, gmailMsgId, gmailToken);
-                            for (var rb in rawBytesList) {
+                            rawBytesList = findAttachmentParts(gmailPayload.parts, gmailMsgId, gmailToken);
+                            for (rb in rawBytesList) {
                                 arrayAppend(attachments, { name: "report", bytes: rb });
                             }
                         } else if (structKeyExists(gmailPayload, "body") AND structKeyExists(gmailPayload.body, "data") AND len(gmailPayload.body.data)) {
-                            // Single-part message
-                            var topMime = lCase(gmailPayload.mimeType ?: "");
+                            // Single-part message — check if it's a DMARC attachment itself
+                            topMime = lCase(gmailPayload.mimeType ?: "");
+                            topFile = lCase(gmailPayload.filename ?: "");
                             if (reFindNoCase("application/(zip|gzip|x-zip|x-gzip|octet-stream|xml)", topMime)
-                                OR reFindNoCase("\.xml|\.gz|\.zip", lCase(gmailPayload.filename ?: ""))) {
-                                var topBytes = b64urlDecode(gmailPayload.body.data);
+                                OR reFindNoCase("\.(zip|gz|xml)$", topFile)) {
+                                topBytes = b64urlDecode(gmailPayload.body.data);
                                 if (NOT isNull(topBytes) AND arrayLen(topBytes) GT 4)
                                     arrayAppend(attachments, { name: "report", bytes: topBytes });
                             }
+                        } else {
+                            // No parts array and no body data — log payload shape for diagnosis
+                            logLine("  Gmail: msg=#gmailMsgId# has no parts[] and no body.data — mimeType=#lCase(gmailPayload.mimeType ?: 'unknown')#", "WARN");
                         }
 
                         if (NOT arrayLen(attachments)) {
                             logLine("  Gmail: no attachment bytes for msg=#gmailMsgId# sub=#left(msgSubject,60)#", "WARN");
                             gmailSkip++;
                             totalSkip++;
-                            // Still dispose — it's not a DMARC message
+                            // Still dispose — not a parseable DMARC message
                             markGmailMessage(gmailToken, gmailMsgId,
                                 application.poller.markAsRead,
                                 structKeyExists(application.poller, "deleteAfter") AND application.poller.deleteAfter);
