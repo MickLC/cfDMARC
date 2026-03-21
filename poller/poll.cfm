@@ -2,21 +2,14 @@
       DMARC report poller entry point for cfschedule.
 
       Access control: caller must supply ?token= matching application.poller.token.
-      This works regardless of how Apache/AJP rewrites remote_addr.
 
-      cfimap action reference (Lucee):
-        getHeaderOnly  - fetch headers (subject, from, date, uid, messageNumber, header)
-        getAll         - fetch full message + save attachments to attachmentPath
-                         NOTE: getAll ignores subdirectories and saves attachments
-                         directly into attachmentPath regardless of what you pass.
-                         We snapshot the dir before/after each call to detect new files.
-        markRead       - mark message(s) read by uid
-        open / close   - persistent named connection
+      Uses JavaMail directly for ALL accounts (password and OAuth2).
+      cfimap getAll silently discards MIME parts that lack Content-Disposition:attachment,
+      which is how Google sends DMARC reports. JavaMail gives us every part reliably.
 --->
 <cfinclude template="/includes/functions.cfm">
 
 <cfscript>
-    // Token-based access control
     param name="url.token" default="";
     if (NOT structKeyExists(application, "poller")
         OR NOT structKeyExists(application.poller, "token")
@@ -39,26 +32,56 @@
               type=(arguments.level EQ "ERROR" ? "error" : "information"));
     }
 
-    // Return a set of filenames currently in a directory (files only, not dirs)
-    function dirSnapshot(required string path) {
-        var snap = {};
-        if (NOT directoryExists(arguments.path)) return snap;
-        var q = directoryList(arguments.path, false, "query");
-        for (var f in q) {
-            if (f.type EQ "File") snap[f.name] = true;
+    // Read a JavaMail InputStream into a Java byte array
+    function streamToBytes(required any inputStream) {
+        var baos = createObject("java","java.io.ByteArrayOutputStream").init();
+        var buf  = createObject("java","java.lang.reflect.Array").newInstance(
+                       createObject("java","java.lang.Byte").TYPE, javaCast("int",8192));
+        var n = arguments.inputStream.read(buf);
+        while (n GT 0) {
+            baos.write(buf, javaCast("int",0), javaCast("int",n));
+            n = arguments.inputStream.read(buf);
         }
-        return snap;
+        arguments.inputStream.close();
+        return baos.toByteArray();
     }
 
-    // Return array of {name, file} for files in dirPath not in beforeSnap
-    function newFilesAfter(required string dirPath, required struct beforeSnap) {
-        var result = [];
-        if (NOT directoryExists(arguments.dirPath)) return result;
-        var q = directoryList(arguments.dirPath, false, "query", "*.xml|*.zip|*.gz");
-        for (var f in q) {
-            if (f.type EQ "File" AND NOT structKeyExists(arguments.beforeSnap, f.name)) {
-                arrayAppend(result, { name: f.name, file: f.directory & "/" & f.name });
+    // Walk a MIME Part recursively; collect binary attachments and text body
+    // Returns struct { attachments: [], body: "" }
+    function walkPart(required any part) {
+        var result = { attachments: [], body: "" };
+        var ct = javaCast("string", arguments.part.getContentType() ?: "");
+        var disp = "";
+        try { disp = javaCast("string", arguments.part.getDisposition() ?: ""); } catch(any e) {}
+
+        // Binary attachment types we care about
+        var isBinary = reFindNoCase("(application/zip|application/gzip|application/x-gzip|application/octet-stream|text/xml|application/xml)", ct);
+        var isAttachment = (disp EQ "ATTACHMENT") OR isBinary;
+
+        if (isAttachment OR (disp EQ "" AND isBinary)) {
+            var fname = "";
+            try { fname = javaCast("string", arguments.part.getFileName() ?: ""); } catch(any e) {}
+            if (NOT len(fname)) fname = "attachment";
+            arrayAppend(result.attachments, { name: fname, bytes: streamToBytes(arguments.part.getInputStream()) });
+            return result;
+        }
+
+        // Recurse into multipart
+        try {
+            var content = arguments.part.getContent();
+            if (isInstanceOf(content, "javax.mail.Multipart")) {
+                for (var i = 0; i LT content.getCount(); i++) {
+                    var sub = walkPart(content.getBodyPart(i));
+                    result.attachments.addAll(sub.attachments);
+                    if (NOT len(result.body) AND len(sub.body)) result.body = sub.body;
+                }
+                return result;
             }
+        } catch(any e) {}
+
+        // Leaf text/plain or text/html
+        if (reFindNoCase("text/(plain|html)", ct)) {
+            try { result.body = javaCast("string", arguments.part.getContent() ?: ""); } catch(any e) {}
         }
         return result;
     }
@@ -70,7 +93,7 @@
                 password, auth_type,
                 oauth_access_token, oauth_refresh_token,
                 oauth_client_id, oauth_client_secret,
-                oauth_token_expiry, use_ssl, mailbox, last_polled
+                oauth_token_expiry, use_ssl, mailbox
          FROM   imap_accounts
          WHERE  active = 1
          ORDER  BY id",
@@ -85,35 +108,33 @@
 
         try {
 
+            // ----------------------------------------------------------
+            // Resolve credential
+            // ----------------------------------------------------------
             imapPassword = "";
 
             if (acct.auth_type EQ "oauth2") {
-
                 needRefresh = NOT isDate(acct.oauth_token_expiry)
                               OR dateDiff("n", now(), acct.oauth_token_expiry) LT 5;
-
                 if (needRefresh) {
-                    logLine("Refreshing access token");
+                    logLine("Refreshing OAuth2 access token");
                     refreshToken = decryptValue(acct.oauth_refresh_token);
                     clientId     = acct.oauth_client_id;
                     clientSecret = decryptValue(acct.oauth_client_secret);
-
                     if (NOT len(refreshToken) OR NOT len(clientId) OR NOT len(clientSecret)) {
-                        logLine("Missing OAuth2 credentials for #acct.label# — skipping", "ERROR");
+                        logLine("Missing OAuth2 credentials — skipping", "ERROR");
                         totalError++;
                         queryExecute("UPDATE imap_accounts SET last_status=? WHERE id=?",
                             [{value:"Error: missing OAuth2 credentials",cfsqltype:"cf_sql_varchar"},{value:acct.id,cfsqltype:"cf_sql_integer"}],
                             {datasource:application.db.dsn});
                         continue;
                     }
-
                     cfhttp(url="https://oauth2.googleapis.com/token", method="POST", result="tokenResp") {
                         cfhttpparam(type="formfield", name="client_id",     value=clientId);
                         cfhttpparam(type="formfield", name="client_secret", value=clientSecret);
                         cfhttpparam(type="formfield", name="refresh_token", value=refreshToken);
                         cfhttpparam(type="formfield", name="grant_type",    value="refresh_token");
                     }
-
                     tokenData = deserializeJSON(tokenResp.fileContent);
                     if (NOT structKeyExists(tokenData, "access_token")) {
                         logLine("Token refresh failed: #tokenResp.fileContent#", "ERROR");
@@ -123,7 +144,6 @@
                             {datasource:application.db.dsn});
                         continue;
                     }
-
                     newExpiry = dateAdd("s", val(tokenData.expires_in ?: 3599), now());
                     queryExecute(
                         "UPDATE imap_accounts SET oauth_access_token=?, oauth_token_expiry=? WHERE id=?",
@@ -138,148 +158,80 @@
                 } else {
                     imapPassword = decryptValue(acct.oauth_access_token);
                 }
-
             } else {
                 imapPassword = decryptValue(acct.password);
             }
 
             if (NOT len(imapPassword)) {
-                logLine("Empty credential for #acct.label# — skipping", "ERROR");
+                logLine("Empty credential — skipping", "ERROR");
                 totalError++;
                 continue;
             }
 
-            mailbox    = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
-            connLabel  = "dmarc_poll_#acct.id#";
-            // attachBase: cfimap getAll saves attachments here directly (ignores subdirs)
-            attachBase = getTempDirectory() & "dmarc_poll/";
-            if (NOT directoryExists(attachBase)) directoryCreate(attachBase);
+            // ----------------------------------------------------------
+            // Open JavaMail store
+            // ----------------------------------------------------------
+            mailbox  = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
+            protocol = acct.use_ssl ? "imaps" : "imap";
+
+            props = createObject("java","java.util.Properties").init();
+            props.setProperty("mail.store.protocol", protocol);
+            props.setProperty("mail.#protocol#.host", acct.host);
+            props.setProperty("mail.#protocol#.port", javaCast("string", acct.port));
+            props.setProperty("mail.#protocol#.ssl.enable", acct.use_ssl ? "true" : "false");
 
             if (acct.auth_type EQ "oauth2") {
-
-                xoauth2Raw   = "user=#acct.username#" & chr(1) & "auth=Bearer #imapPassword#" & chr(1) & chr(1);
-                xoauth2Token = toBase64(xoauth2Raw);
-
-                props = createObject("java","java.util.Properties").init();
-                props.setProperty("mail.store.protocol",        "imaps");
-                props.setProperty("mail.imaps.host",            acct.host);
-                props.setProperty("mail.imaps.port",            javaCast("string",acct.port));
-                props.setProperty("mail.imaps.ssl.enable",      "true");
-                props.setProperty("mail.imaps.auth.mechanisms", "XOAUTH2");
-                props.setProperty("mail.imaps.sasl.enable",     "true");
-                props.setProperty("mail.imaps.sasl.mechanisms", "XOAUTH2");
-
-                jSession   = createObject("java","javax.mail.Session").getInstance(props);
-                imapStore  = jSession.getStore("imaps");
-                imapStore.connect(acct.host, acct.username, xoauth2Token);
-                imapFolder = imapStore.getFolder(mailbox);
-                imapFolder.open(createObject("java","javax.mail.Folder").READ_WRITE);
-                flagSeen   = createObject("java","javax.mail.Flags$Flag");
-                searchTerm = createObject("java","javax.mail.search.FlagTerm").init(
-                    createObject("java","javax.mail.Flags").init(flagSeen.SEEN),
-                    javaCast("boolean",false)
+                props.setProperty("mail.#protocol#.auth.mechanisms",  "XOAUTH2");
+                props.setProperty("mail.#protocol#.sasl.enable",      "true");
+                props.setProperty("mail.#protocol#.sasl.mechanisms",  "XOAUTH2");
+                connectPassword = toBase64(
+                    "user=#acct.username#" & chr(1) & "auth=Bearer #imapPassword#" & chr(1) & chr(1)
                 );
-                jMessages   = imapFolder.search(searchTerm);
-                useJavaMail = true;
-                msgCount    = arrayLen(jMessages);
-
             } else {
-
-                cfimap(
-                    action     = "open",
-                    connection = connLabel,
-                    server     = acct.host,
-                    port       = acct.port,
-                    username   = acct.username,
-                    password   = imapPassword,
-                    secure     = (acct.use_ssl ? true : false),
-                    timeout    = 60
-                );
-
-                cfimap(
-                    action     = "getHeaderOnly",
-                    connection = connLabel,
-                    folder     = mailbox,
-                    name       = "qHeaders",
-                    maxRows    = application.poller.batchSize
-                );
-
-                useJavaMail = false;
-                msgCount    = qHeaders.recordCount;
+                connectPassword = imapPassword;
             }
 
-            logLine("#msgCount# message(s) in mailbox");
+            jSession   = createObject("java","javax.mail.Session").getInstance(props);
+            imapStore  = jSession.getStore(protocol);
+            imapStore.connect(acct.host, acct.username, connectPassword);
+            imapFolder = imapStore.getFolder(mailbox);
+            imapFolder.open(createObject("java","javax.mail.Folder").READ_WRITE);
 
-            for (msgIdx = 1; msgIdx LTE msgCount; msgIdx++) {
+            // Fetch all messages (we deduplicate by message_id, so seeing read messages is fine)
+            jMessages = imapFolder.getMessages();
+            msgCount  = arrayLen(jMessages);
+
+            // Limit to batchSize, taking the most recent
+            startIdx = max(1, msgCount - application.poller.batchSize + 1);
+            logLine("#msgCount# message(s) in mailbox; processing #(msgCount - startIdx + 1)#");
+
+            // ----------------------------------------------------------
+            // Process messages
+            // ----------------------------------------------------------
+            for (msgIdx = startIdx; msgIdx LTE msgCount; msgIdx++) {
 
                 try {
-                    if (useJavaMail) {
+                    jMsg         = jMessages[msgIdx - 1];
+                    msgSubject   = javaCast("string", jMsg.getSubject() ?: "");
+                    contentType  = javaCast("string", jMsg.getContentType() ?: "");
 
-                        jMsg         = jMessages[msgIdx - 1];
-                        msgUID       = javaCast("string", jMsg.getMessageNumber());
-                        msgSubject   = javaCast("string", jMsg.getSubject() ?: "");
-                        contentType  = javaCast("string", jMsg.getContentType() ?: "");
-                        msgMessageId = javaCast("string", jMsg.getHeader("Message-ID")[1] ?: createUUID());
-                        msgBody      = "";
-                        attachments  = [];
+                    // Get Message-ID header
+                    msgMessageId = "";
+                    try {
+                        hdrs = jMsg.getHeader("Message-ID");
+                        if (NOT isNull(hdrs) AND arrayLen(hdrs) GT 0)
+                            msgMessageId = javaCast("string", hdrs[1]);
+                    } catch(any e) {}
+                    if (NOT len(msgMessageId)) msgMessageId = createUUID();
 
-                        content = jMsg.getContent();
-                        if (isInstanceOf(content, "javax.mail.Multipart")) {
-                            for (pIdx = 0; pIdx LT content.getCount(); pIdx++) {
-                                part     = content.getBodyPart(pIdx);
-                                partDisp = javaCast("string", part.getDisposition() ?: "");
-                                partCT   = javaCast("string", part.getContentType() ?: "");
-                                if (partDisp EQ "ATTACHMENT"
-                                    OR reFindNoCase("(application/zip|application/gzip|application/x-gzip|application/octet-stream|text/xml|application/xml)", partCT)) {
-                                    partName = javaCast("string", part.getFileName() ?: "att_#pIdx#");
-                                    partIS   = part.getInputStream();
-                                    baos     = createObject("java","java.io.ByteArrayOutputStream").init();
-                                    buf      = createObject("java","java.lang.reflect.Array").newInstance(
-                                                   createObject("java","java.lang.Byte").TYPE, javaCast("int",8192));
-                                    bytesRead = partIS.read(buf);
-                                    while (bytesRead GT 0) {
-                                        baos.write(buf, javaCast("int",0), javaCast("int",bytesRead));
-                                        bytesRead = partIS.read(buf);
-                                    }
-                                    partIS.close();
-                                    arrayAppend(attachments, {name:partName, bytes:baos.toByteArray()});
-                                } else {
-                                    try { msgBody &= part.getContent(); } catch(any ignored) {}
-                                }
-                            }
-                        } else if (isSimpleValue(content)) {
-                            msgBody = javaCast("string", content);
-                        }
+                    // Walk MIME structure to collect attachments and body
+                    parsed      = walkPart(jMsg);
+                    attachments = parsed.attachments;
+                    msgBody     = parsed.body;
 
-                    } else {
+                    logLine("  uid=#jMsg.getMessageNumber()# attachments=#arrayLen(attachments)# subject=#msgSubject#");
 
-                        msgUID = qHeaders.uid[msgIdx];
-
-                        // Snapshot dir before getAll so we can detect newly added files.
-                        // cfimap getAll saves attachments directly into attachmentPath,
-                        // not into subdirectories, regardless of what path we give it.
-                        beforeSnap = dirSnapshot(attachBase);
-
-                        cfimap(
-                            action                  = "getAll",
-                            connection              = connLabel,
-                            folder                  = mailbox,
-                            uid                     = msgUID,
-                            attachmentPath          = attachBase,
-                            generateUniqueFilenames = true,
-                            name                    = "qMsg"
-                        );
-
-                        msgSubject   = qMsg.subject;
-                        contentType  = qMsg.header;
-                        msgMessageId = len(trim(qMsg.messageId)) ? qMsg.messageId : createUUID();
-                        msgBody      = len(trim(qMsg.body)) ? qMsg.body : "";
-
-                        // Find files added by this getAll call
-                        attachments  = newFilesAfter(attachBase, beforeSnap);
-                        logLine("  Found #arrayLen(attachments)# attachment(s) for uid=#msgUID#");
-                    }
-
+                    // Deduplicate
                     cleanMsgId = reReplace(trim(msgMessageId), "[<>\s]", "", "ALL");
                     if (NOT len(cleanMsgId)) cleanMsgId = createUUID();
 
@@ -288,42 +240,28 @@
                         {datasource:application.db.dsn});
 
                     if (qDupe.recordCount) {
-                        logLine("  Duplicate message_id=#cleanMsgId# — skipping");
+                        logLine("  Duplicate — skipping");
                         totalSkip++;
-                        if (application.poller.markAsRead) {
-                            if (useJavaMail)
-                                jMsg.setFlag(createObject("java","javax.mail.Flags$Flag").SEEN, true);
-                            else
-                                try { cfimap(action="markRead", connection=connLabel, folder=mailbox, uid=msgUID); } catch(any e2) {}
-                        }
+                        if (application.poller.markAsRead)
+                            jMsg.setFlag(createObject("java","javax.mail.Flags$Flag").SEEN, true);
                         continue;
                     }
 
+                    // Route RUF vs RUA
                     isRUF = reFindNoCase("multipart/report", contentType)
                             AND reFindNoCase("report-type=feedback-report", contentType);
                     if (NOT isRUF) isRUF = reFindNoCase("feedback-report", msgBody);
 
                     if (isRUF) {
-                        logLine("  -> RUF (subject: #msgSubject#)");
+                        logLine("  -> RUF");
                         include "/poller/parse_ruf.cfm";
                     } else {
-                        logLine("  -> RUA (subject: #msgSubject#)");
+                        logLine("  -> RUA");
                         include "/poller/parse_rua.cfm";
                     }
 
-                    // Clean up attachment files after processing
-                    for (att in attachments) {
-                        if (structKeyExists(att, "file") AND fileExists(att.file)) {
-                            try { fileDelete(att.file); } catch(any e) {}
-                        }
-                    }
-
-                    if (application.poller.markAsRead) {
-                        if (useJavaMail)
-                            jMsg.setFlag(createObject("java","javax.mail.Flags$Flag").SEEN, true);
-                        else
-                            try { cfimap(action="markRead", connection=connLabel, folder=mailbox, uid=msgUID); } catch(any ignored) {}
-                    }
+                    if (application.poller.markAsRead)
+                        jMsg.setFlag(createObject("java","javax.mail.Flags$Flag").SEEN, true);
 
                     totalNew++;
 
@@ -333,12 +271,8 @@
                 }
             }
 
-            if (useJavaMail) {
-                try { imapFolder.close(false); } catch(any e) {}
-                try { imapStore.close();        } catch(any e) {}
-            } else {
-                try { cfimap(action="close", connection=connLabel); } catch(any e) {}
-            }
+            try { imapFolder.close(false); } catch(any e) {}
+            try { imapStore.close();        } catch(any e) {}
 
             queryExecute(
                 "UPDATE imap_accounts SET last_polled=NOW(), last_status=? WHERE id=?",
@@ -352,7 +286,8 @@
         } catch(any acctErr) {
             logLine("ACCOUNT ERROR (#acct.label#): #acctErr.message# | #acctErr.detail#", "ERROR");
             totalError++;
-            try { cfimap(action="close", connection=connLabel); } catch(any e) {}
+            try { imapFolder.close(false); } catch(any e) {}
+            try { imapStore.close();        } catch(any e) {}
             queryExecute("UPDATE imap_accounts SET last_status=? WHERE id=?",
                 [{value:"Error: " & left(acctErr.message,200), cfsqltype:"cf_sql_varchar"},{value:acct.id,cfsqltype:"cf_sql_integer"}],
                 {datasource:application.db.dsn});
