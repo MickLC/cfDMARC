@@ -4,17 +4,17 @@
       Access control: caller must supply ?token= matching application.poller.token.
 
       Architecture:
-        - cfimap getHeaderOnly  : list messages, get UIDs and Message-IDs
-        - doveadm fetch         : retrieve raw message body per UID
-        - CFML base64+decompress: decode the ZIP/GZ attachment in CFML
+        - cfimap getHeaderOnly  : list messages, get UIDs and Message-IDs for dedup
+        - doveadm fetch         : retrieve hdr + body per UID (fields: "hdr body")
+        - java.util.Base64      : decode base64 body
+        - extractXmlFromBytes   : decompress ZIP/GZ in parse_rua.cfm
 
       Why doveadm instead of Jakarta Mail:
-        Jakarta Mail's StreamProvider SPI cannot be bootstrapped from Lucee's
-        OSGi classloader context. doveadm runs as a local process and has no
-        classloader constraints.
+        Jakarta Mail StreamProvider SPI cannot be bootstrapped in Lucee's OSGi
+        classloader context. doveadm is a local process with no such constraints.
 
-      Note: this approach only works for the local Dovecot account on Harry.
-      OAuth2/Gmail accounts would need a different fetch mechanism (future work).
+      Note: doveadm path only works for local Dovecot accounts on this server.
+      OAuth2/Gmail accounts need a different fetch mechanism (future work).
 --->
 <cfinclude template="/includes/functions.cfm">
 
@@ -41,41 +41,41 @@
               type=(arguments.level EQ "ERROR" ? "error" : "information"));
     }
 
-    // Fetch raw body of a message via doveadm.
+    // Fetch message headers and body via doveadm.
+    // Valid doveadm fetch fields include: uid hdr body (NOT "header")
     // Returns struct { body: "", headers: "", contentType: "", messageId: "" }
     function fetchViaDoveadm(required string username, required string mailbox, required string uid) {
         var result = { body:"", headers:"", contentType:"", messageId:"" };
 
-        // Fetch body (attachment content) and header
         cfexecute(
             name          = "/usr/bin/doveadm",
-            arguments     = 'fetch -u #arguments.username# "uid body header" mailbox #arguments.mailbox# uid #arguments.uid#',
+            arguments     = 'fetch -u #arguments.username# "hdr body" mailbox #arguments.mailbox# uid #arguments.uid#',
             variable      = "fetchOut",
             errorvariable = "fetchErr",
             timeout       = 30
         );
 
         if (len(trim(fetchErr))) {
-            logLine("  doveadm error for uid=#arguments.uid#: #left(fetchErr,200)#", "WARN");
+            logLine("  doveadm stderr uid=#arguments.uid#: #left(fetchErr,300)#", "WARN");
         }
 
-        // Parse doveadm output: sections separated by blank lines after "field: value" markers
-        // Format: "uid: N\nbody:\nBASE64DATA\nheader:\nHEADER TEXT\n"
-        var bodyStart   = reFindNoCase("(?m)^body:\s*\n", fetchOut);
-        var headerStart = reFindNoCase("(?m)^header:\s*\n", fetchOut);
+        // doveadm output format for multiple fields:
+        // hdr:\n<header text>\nbody:\n<base64 body>\n
+        var hdrStart  = reFindNoCase("(?m)^hdr:\s*$",  fetchOut);
+        var bodyStart = reFindNoCase("(?m)^body:\s*$", fetchOut);
 
-        if (bodyStart GT 0) {
-            var afterBodyLabel = bodyStart + len(reMatch("(?m)^body:\s*\n", fetchOut)[1]);
-            if (headerStart GT 0 AND headerStart GT afterBodyLabel) {
-                result.body = trim(mid(fetchOut, afterBodyLabel, headerStart - afterBodyLabel));
+        if (hdrStart GT 0) {
+            var afterHdrLabel = hdrStart + len(reMatch("(?m)^hdr:\s*$\n?", fetchOut)[1]);
+            if (bodyStart GT 0 AND bodyStart GT afterHdrLabel) {
+                result.headers = trim(mid(fetchOut, afterHdrLabel, bodyStart - afterHdrLabel));
             } else {
-                result.body = trim(mid(fetchOut, afterBodyLabel, len(fetchOut) - afterBodyLabel + 1));
+                result.headers = trim(mid(fetchOut, afterHdrLabel, len(fetchOut) - afterHdrLabel + 1));
             }
         }
 
-        if (headerStart GT 0) {
-            var afterHeaderLabel = headerStart + len(reMatch("(?m)^header:\s*\n", fetchOut)[1]);
-            result.headers = trim(mid(fetchOut, afterHeaderLabel, len(fetchOut) - afterHeaderLabel + 1));
+        if (bodyStart GT 0) {
+            var afterBodyLabel = bodyStart + len(reMatch("(?m)^body:\s*$\n?", fetchOut)[1]);
+            result.body = trim(mid(fetchOut, afterBodyLabel, len(fetchOut) - afterBodyLabel + 1));
         }
 
         // Extract Content-Type from headers
@@ -91,9 +91,8 @@
         return result;
     }
 
-    // Decode base64 body string to byte array
+    // Decode base64 string to byte array (strips whitespace first)
     function base64ToBytes(required string b64) {
-        // Strip whitespace from base64 string
         var clean = reReplace(arguments.b64, "\s+", "", "ALL");
         if (NOT len(clean)) return javaCast("null","");
         return createObject("java","java.util.Base64").getDecoder().decode(clean);
@@ -117,18 +116,13 @@
         logLine("--- Account: #acct.label# (#acct.username#) ---");
 
         try {
-            // ----------------------------------------------------------
-            // Only doveadm-accessible accounts supported for now
-            // (local Dovecot accounts on this server)
-            // ----------------------------------------------------------
+
             if (acct.auth_type EQ "oauth2") {
-                logLine("  OAuth2 accounts not yet supported via doveadm path — skipping", "WARN");
+                logLine("  OAuth2 accounts not yet supported via doveadm — skipping", "WARN");
                 continue;
             }
 
-            mailbox = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
-
-            // Get header list via cfimap (just needs UIDs and Message-IDs)
+            mailbox      = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
             imapPassword = decryptValue(acct.password);
 
             cfimap(
@@ -159,10 +153,9 @@
                     msgUID     = qHeaders.uid[msgIdx];
                     msgSubject = qHeaders.subject[msgIdx];
 
-                    // Quick dedup check using Message-ID from headers
-                    // cfimap getHeaderOnly returns a header column with raw headers
-                    rawHdr    = qHeaders.header[msgIdx];
-                    midMatch  = reFind("(?i)Message-ID:\s*([^\r\n]+)", rawHdr, 1, true);
+                    // Quick dedup from header column (avoids doveadm call for already-seen messages)
+                    rawHdr     = qHeaders.header[msgIdx];
+                    midMatch   = reFind("(?i)Message-ID:\s*([^\r\n]+)", rawHdr, 1, true);
                     quickMsgId = "";
                     if (midMatch.len[1] GT 0 AND arrayLen(midMatch.len) GT 1)
                         quickMsgId = reReplace(trim(mid(rawHdr, midMatch.pos[2], midMatch.len[2])), "[<>\s]", "", "ALL");
@@ -172,7 +165,7 @@
                             [{value:quickMsgId, cfsqltype:"cf_sql_varchar"}],
                             {datasource:application.db.dsn});
                         if (qDupe.recordCount) {
-                            logLine("  uid=#msgUID# duplicate — skipping");
+                            logLine("  uid=#msgUID# already in DB — skipping");
                             totalSkip++;
                             if (application.poller.markAsRead)
                                 try { cfimap(action="markRead", connection="poll_#acct.id#", folder=mailbox, uid=msgUID); } catch(any e) {}
@@ -180,22 +173,20 @@
                         }
                     }
 
-                    logLine("  uid=#msgUID# fetching body...");
+                    logLine("  uid=#msgUID# fetching via doveadm...");
 
-                    // Fetch full message via doveadm
-                    fetched     = fetchViaDoveadm(acct.username, mailbox, msgUID);
-                    contentType = len(fetched.contentType) ? fetched.contentType : "";
-                    msgBody     = "";
-                    attachments = [];
+                    fetched      = fetchViaDoveadm(acct.username, mailbox, msgUID);
+                    contentType  = fetched.contentType;
+                    msgBody      = "";
+                    attachments  = [];
                     msgMessageId = len(fetched.messageId) ? fetched.messageId : (len(quickMsgId) ? quickMsgId : createUUID());
 
-                    // The body from doveadm is base64-encoded attachment content
                     if (len(trim(fetched.body))) {
                         try {
                             rawBytes = base64ToBytes(fetched.body);
                             if (NOT isNull(rawBytes) AND arrayLen(rawBytes) GT 1) {
                                 attachments = [{ name: "report", bytes: rawBytes }];
-                                logLine("  uid=#msgUID# decoded #arrayLen(rawBytes)# bytes");
+                                logLine("  uid=#msgUID# decoded #arrayLen(rawBytes)# bytes from body");
                             }
                         } catch(any decErr) {
                             logLine("  uid=#msgUID# base64 decode error: #decErr.message#", "WARN");
@@ -205,22 +196,21 @@
                     cleanMsgId = reReplace(trim(msgMessageId), "[<>\s]", "", "ALL");
                     if (NOT len(cleanMsgId)) cleanMsgId = createUUID();
 
+                    // Final dedup (in case quickMsgId was empty)
                     qDupe = queryExecute("SELECT id FROM report WHERE message_id=? LIMIT 1",
                         [{value:cleanMsgId, cfsqltype:"cf_sql_varchar"}],
                         {datasource:application.db.dsn});
-
                     if (qDupe.recordCount) {
-                        logLine("  Duplicate — skipping");
+                        logLine("  uid=#msgUID# duplicate — skipping");
                         totalSkip++;
                         if (application.poller.markAsRead)
                             try { cfimap(action="markRead", connection="poll_#acct.id#", folder=mailbox, uid=msgUID); } catch(any e) {}
                         continue;
                     }
 
-                    // Route RUF vs RUA
                     isRUF = reFindNoCase("multipart/report", contentType)
                             AND reFindNoCase("report-type=feedback-report", contentType);
-                    if (NOT isRUF AND len(msgBody)) isRUF = reFindNoCase("feedback-report", msgBody);
+                    if (NOT isRUF AND len(fetched.headers)) isRUF = reFindNoCase("feedback-report", fetched.headers);
 
                     if (isRUF) {
                         logLine("  -> RUF");
