@@ -3,9 +3,10 @@
 
       Access control: caller must supply ?token= matching application.poller.token.
 
-      Uses JavaMail directly for ALL accounts (password and OAuth2).
-      cfimap getAll silently discards MIME parts that lack Content-Disposition:attachment,
-      which is how Google sends DMARC reports. JavaMail gives us every part reliably.
+      Uses Jakarta Mail (jakarta.mail) loaded explicitly from Lucee's own JAR,
+      preventing the javax.mail/jakarta.mail classloader conflict.
+      cfimap getAll silently discards inline MIME parts (no Content-Disposition:attachment)
+      which is how Google sends DMARC reports. Jakarta Mail gives us every part reliably.
 --->
 <cfinclude template="/includes/functions.cfm">
 
@@ -25,6 +26,10 @@
     totalSkip  = 0;
     totalError = 0;
 
+    // Jakarta Mail JAR — load explicitly so Lucee's classloader is used,
+    // preventing the javax.mail vs jakarta.mail classloader conflict.
+    MAIL_JAR = "/opt/lucee/tomcat/lucee-server/mvn/com/sun/mail/jakarta.mail/2.0.2/jakarta.mail-2.0.2.jar";
+
     function logLine(required string msg, string level="INFO") {
         var ts = dateTimeFormat(now(), "yyyy-mm-dd HH:nn:ss");
         arrayAppend(pollLog, "[#ts#] [#arguments.level#] #arguments.msg#");
@@ -32,7 +37,6 @@
               type=(arguments.level EQ "ERROR" ? "error" : "information"));
     }
 
-    // Read a JavaMail InputStream into a Java byte array
     function streamToBytes(required any inputStream) {
         var baos = createObject("java","java.io.ByteArrayOutputStream").init();
         var buf  = createObject("java","java.lang.reflect.Array").newInstance(
@@ -46,43 +50,50 @@
         return baos.toByteArray();
     }
 
-    // Walk a MIME Part recursively; collect binary attachments and text body
+    // Walk a MIME Part recursively via Jakarta Mail.
+    // Collects every binary part regardless of Content-Disposition.
     // Returns struct { attachments: [], body: "" }
     function walkPart(required any part) {
         var result = { attachments: [], body: "" };
-        var ct = javaCast("string", arguments.part.getContentType() ?: "");
+        var ct   = "";
         var disp = "";
-        try { disp = javaCast("string", arguments.part.getDisposition() ?: ""); } catch(any e) {}
+        try { ct   = javaCast("string", arguments.part.getContentType() ?: ""); } catch(any e) {}
+        try { disp = uCase(javaCast("string", arguments.part.getDisposition() ?: "")); } catch(any e) {}
 
-        // Binary attachment types we care about
-        var isBinary = reFindNoCase("(application/zip|application/gzip|application/x-gzip|application/octet-stream|text/xml|application/xml)", ct);
-        var isAttachment = (disp EQ "ATTACHMENT") OR isBinary;
+        var isBinary = reFindNoCase(
+            "(application/zip|application/gzip|application/x-gzip|application/octet-stream|text/xml|application/xml)", ct);
 
-        if (isAttachment OR (disp EQ "" AND isBinary)) {
+        // Collect as attachment if: marked ATTACHMENT, or binary content type
+        if (disp EQ "ATTACHMENT" OR isBinary) {
             var fname = "";
             try { fname = javaCast("string", arguments.part.getFileName() ?: ""); } catch(any e) {}
-            if (NOT len(fname)) fname = "attachment";
-            arrayAppend(result.attachments, { name: fname, bytes: streamToBytes(arguments.part.getInputStream()) });
+            if (NOT len(trim(fname))) fname = "attachment";
+            try {
+                arrayAppend(result.attachments,
+                    { name: fname, bytes: streamToBytes(arguments.part.getInputStream()) });
+            } catch(any e) {}
             return result;
         }
 
-        // Recurse into multipart
+        // Recurse into any Multipart content
         try {
             var content = arguments.part.getContent();
-            if (isInstanceOf(content, "javax.mail.Multipart")) {
+            // Check class name rather than instanceof to avoid classloader issues
+            var className = content.getClass().getName();
+            if (findNoCase("Multipart", className)) {
                 for (var i = 0; i LT content.getCount(); i++) {
                     var sub = walkPart(content.getBodyPart(i));
-                    result.attachments.addAll(sub.attachments);
+                    for (var a in sub.attachments) arrayAppend(result.attachments, a);
                     if (NOT len(result.body) AND len(sub.body)) result.body = sub.body;
                 }
                 return result;
             }
+            // Leaf text content
+            if (reFindNoCase("text/(plain|html)", ct)) {
+                result.body = javaCast("string", content ?: "");
+            }
         } catch(any e) {}
 
-        // Leaf text/plain or text/html
-        if (reFindNoCase("text/(plain|html)", ct)) {
-            try { result.body = javaCast("string", arguments.part.getContent() ?: ""); } catch(any e) {}
-        }
         return result;
     }
 
@@ -108,9 +119,6 @@
 
         try {
 
-            // ----------------------------------------------------------
-            // Resolve credential
-            // ----------------------------------------------------------
             imapPassword = "";
 
             if (acct.auth_type EQ "oauth2") {
@@ -168,12 +176,10 @@
                 continue;
             }
 
-            // ----------------------------------------------------------
-            // Open JavaMail store
-            // ----------------------------------------------------------
             mailbox  = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
             protocol = acct.use_ssl ? "imaps" : "imap";
 
+            // Load Session from the explicit JAR to use Lucee's classloader
             props = createObject("java","java.util.Properties").init();
             props.setProperty("mail.store.protocol", protocol);
             props.setProperty("mail.#protocol#.host", acct.host);
@@ -181,9 +187,9 @@
             props.setProperty("mail.#protocol#.ssl.enable", acct.use_ssl ? "true" : "false");
 
             if (acct.auth_type EQ "oauth2") {
-                props.setProperty("mail.#protocol#.auth.mechanisms",  "XOAUTH2");
-                props.setProperty("mail.#protocol#.sasl.enable",      "true");
-                props.setProperty("mail.#protocol#.sasl.mechanisms",  "XOAUTH2");
+                props.setProperty("mail.#protocol#.auth.mechanisms", "XOAUTH2");
+                props.setProperty("mail.#protocol#.sasl.enable",     "true");
+                props.setProperty("mail.#protocol#.sasl.mechanisms", "XOAUTH2");
                 connectPassword = toBase64(
                     "user=#acct.username#" & chr(1) & "auth=Bearer #imapPassword#" & chr(1) & chr(1)
                 );
@@ -191,31 +197,24 @@
                 connectPassword = imapPassword;
             }
 
-            jSession   = createObject("java","javax.mail.Session").getInstance(props);
+            jSession   = createObject("java", "jakarta.mail.Session", MAIL_JAR).getInstance(props);
             imapStore  = jSession.getStore(protocol);
             imapStore.connect(acct.host, acct.username, connectPassword);
             imapFolder = imapStore.getFolder(mailbox);
-            imapFolder.open(createObject("java","javax.mail.Folder").READ_WRITE);
+            imapFolder.open(javaCast("int", 2)); // Folder.READ_WRITE = 2
 
-            // Fetch all messages (we deduplicate by message_id, so seeing read messages is fine)
             jMessages = imapFolder.getMessages();
             msgCount  = arrayLen(jMessages);
+            startIdx  = max(1, msgCount - application.poller.batchSize + 1);
+            logLine("#msgCount# message(s); processing #(msgCount - startIdx + 1)#");
 
-            // Limit to batchSize, taking the most recent
-            startIdx = max(1, msgCount - application.poller.batchSize + 1);
-            logLine("#msgCount# message(s) in mailbox; processing #(msgCount - startIdx + 1)#");
-
-            // ----------------------------------------------------------
-            // Process messages
-            // ----------------------------------------------------------
             for (msgIdx = startIdx; msgIdx LTE msgCount; msgIdx++) {
 
                 try {
-                    jMsg         = jMessages[msgIdx - 1];
-                    msgSubject   = javaCast("string", jMsg.getSubject() ?: "");
-                    contentType  = javaCast("string", jMsg.getContentType() ?: "");
+                    jMsg        = jMessages[msgIdx - 1];
+                    msgSubject  = javaCast("string", jMsg.getSubject() ?: "");
+                    contentType = javaCast("string", jMsg.getContentType() ?: "");
 
-                    // Get Message-ID header
                     msgMessageId = "";
                     try {
                         hdrs = jMsg.getHeader("Message-ID");
@@ -224,14 +223,12 @@
                     } catch(any e) {}
                     if (NOT len(msgMessageId)) msgMessageId = createUUID();
 
-                    // Walk MIME structure to collect attachments and body
                     parsed      = walkPart(jMsg);
                     attachments = parsed.attachments;
                     msgBody     = parsed.body;
 
-                    logLine("  uid=#jMsg.getMessageNumber()# attachments=#arrayLen(attachments)# subject=#msgSubject#");
+                    logLine("  msg##msgIdx attachments=#arrayLen(attachments)# subject=#left(msgSubject,60)#");
 
-                    // Deduplicate
                     cleanMsgId = reReplace(trim(msgMessageId), "[<>\s]", "", "ALL");
                     if (NOT len(cleanMsgId)) cleanMsgId = createUUID();
 
@@ -243,11 +240,12 @@
                         logLine("  Duplicate — skipping");
                         totalSkip++;
                         if (application.poller.markAsRead)
-                            jMsg.setFlag(createObject("java","javax.mail.Flags$Flag").SEEN, true);
+                            jMsg.setFlag(
+                                createObject("java","jakarta.mail.Flags$Flag", MAIL_JAR).SEEN,
+                                javaCast("boolean", true));
                         continue;
                     }
 
-                    // Route RUF vs RUA
                     isRUF = reFindNoCase("multipart/report", contentType)
                             AND reFindNoCase("report-type=feedback-report", contentType);
                     if (NOT isRUF) isRUF = reFindNoCase("feedback-report", msgBody);
@@ -261,12 +259,14 @@
                     }
 
                     if (application.poller.markAsRead)
-                        jMsg.setFlag(createObject("java","javax.mail.Flags$Flag").SEEN, true);
+                        jMsg.setFlag(
+                            createObject("java","jakarta.mail.Flags$Flag", MAIL_JAR).SEEN,
+                            javaCast("boolean", true));
 
                     totalNew++;
 
                 } catch(any msgErr) {
-                    logLine("  ERROR msg ##msgIdx: #msgErr.message# | #msgErr.detail#", "ERROR");
+                    logLine("  ERROR msg##msgIdx: #msgErr.message# | #msgErr.detail#", "ERROR");
                     totalError++;
                 }
             }
