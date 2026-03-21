@@ -10,10 +10,11 @@
 
     if (url.action EQ "run") {
         try {
-            cfhttp(url=application.baseURL & "/poller/poll.cfm", method="GET", timeout=300, result="pollResult");
+            pollURL = application.baseURL & "/poller/poll.cfm?token=" & urlEncodedFormat(application.poller.token);
+            cfhttp(url=pollURL, method="GET", timeout=300, result="pollResult");
             pageMessage = find("OK:", pollResult.fileContent)
                 ? "Poll complete: #htmlEditFormat(trim(pollResult.fileContent))#"
-                : "Unexpected response. Check dmarc_poller log.";
+                : "Unexpected response. Check dmarc_poller log. Response: #htmlEditFormat(left(pollResult.fileContent,200))#";
         } catch(any e) {
             pageMessage = "Poll error: #e.message#";
         }

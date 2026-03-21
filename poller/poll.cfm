@@ -1,22 +1,24 @@
 <!--- poller/poll.cfm
       DMARC report poller entry point for cfschedule.
-      Localhost access only.
+
+      Access control: caller must supply ?token= matching application.poller.token.
+      This works regardless of how Apache/AJP rewrites remote_addr.
 
       cfimap action reference (Lucee):
-        getHeaderOnly  - fetch headers only (subject, from, date, uid, messageNumber)
-        getAll         - fetch full message inc. body + save attachments to attachmentPath
-        markRead       - mark message(s) read by uid or messageNumber
-        delete         - delete message(s)
-        open/close     - persistent named connection
-
-      Strategy: open one persistent connection per account, use it for all
-      sub-calls (getAll, markRead), then close it.  This avoids re-authenticating
-      for every message and makes markRead simpler (no server/port repeat needed).
+        getHeaderOnly  - fetch headers (subject, from, date, uid, messageNumber, header)
+        getAll         - fetch full message + save attachments to attachmentPath
+        markRead       - mark message(s) read by uid
+        open / close   - persistent named connection
 --->
 <cfinclude template="/includes/functions.cfm">
 
 <cfscript>
-    if (cgi.remote_addr NEQ "127.0.0.1" AND cgi.remote_addr NEQ "::1") {
+    // Token-based access control — safe behind AJP/reverse-proxy
+    param name="url.token" default="";
+    if (NOT structKeyExists(application, "poller")
+        OR NOT structKeyExists(application.poller, "token")
+        OR url.token NEQ application.poller.token
+        OR NOT len(url.token)) {
         cfheader(statusCode=403, statusText="Forbidden");
         cfabort();
     }
@@ -127,7 +129,6 @@
 
             if (acct.auth_type EQ "oauth2") {
 
-                // OAuth2: JavaMail with XOAUTH2 — cfimap has no XOAUTH2 support
                 xoauth2Raw   = "user=#acct.username#" & chr(1) & "auth=Bearer #imapPassword#" & chr(1) & chr(1);
                 xoauth2Token = toBase64(xoauth2Raw);
 
@@ -156,23 +157,17 @@
 
             } else {
 
-                // Password auth: open a persistent named connection, then use
-                // getHeaderOnly to list messages and getAll to fetch each one.
-                // Using a connection label avoids repeating server/port/credentials
-                // on every cfimap call and makes markRead straightforward.
                 cfimap(
-                    action   = "open",
+                    action     = "open",
                     connection = connLabel,
-                    server   = acct.host,
-                    port     = acct.port,
-                    username = acct.username,
-                    password = imapPassword,
-                    secure   = (acct.use_ssl ? true : false),
-                    timeout  = 60
+                    server     = acct.host,
+                    port       = acct.port,
+                    username   = acct.username,
+                    password   = imapPassword,
+                    secure     = (acct.use_ssl ? true : false),
+                    timeout    = 60
                 );
 
-                // getHeaderOnly returns: subject, from, to, cc, date, uid,
-                //   messageNumber, size, replyTo, header (raw headers string)
                 cfimap(
                     action     = "getHeaderOnly",
                     connection = connLabel,
@@ -230,31 +225,26 @@
 
                     } else {
 
-                        // Fetch the full message via the open connection.
-                        // getAll with a specific uid fetches just that message.
-                        // attachmentPath must exist; we use a per-message subdir.
                         msgUID    = qHeaders.uid[msgIdx];
-                        attachDir = attachBase & msgUID & "/";
+                        attachDir = attachBase & "msg_" & msgUID & "/";
                         if (NOT directoryExists(attachDir)) directoryCreate(attachDir);
 
                         cfimap(
-                            action                 = "getAll",
-                            connection             = connLabel,
-                            folder                 = mailbox,
-                            uid                    = msgUID,
-                            attachmentPath         = attachDir,
+                            action                  = "getAll",
+                            connection              = connLabel,
+                            folder                  = mailbox,
+                            uid                     = msgUID,
+                            attachmentPath          = attachDir,
                             generateUniqueFilenames = true,
-                            name                   = "qMsg"
+                            name                    = "qMsg"
                         );
 
                         msgSubject   = qMsg.subject;
-                        // getAll header column contains the full raw RFC 2822 headers
                         contentType  = qMsg.header;
                         msgMessageId = len(trim(qMsg.messageId)) ? qMsg.messageId : createUUID();
-                        msgBody      = len(trim(qMsg.body)) ? qMsg.body : (structKeyExists(qMsg,"htmlBody") ? qMsg.htmlBody : "");
+                        msgBody      = len(trim(qMsg.body)) ? qMsg.body : "";
                         attachments  = [];
 
-                        // Collect saved attachment files from the per-message dir
                         if (directoryExists(attachDir)) {
                             qAttFiles = directoryList(attachDir, false, "query", "*.xml|*.zip|*.gz");
                             for (af in qAttFiles) {
@@ -266,7 +256,6 @@
                         }
                     }
 
-                    // Deduplicate by Message-ID
                     cleanMsgId = reReplace(trim(msgMessageId), "[<>\s]", "", "ALL");
                     if (NOT len(cleanMsgId)) cleanMsgId = createUUID();
 
@@ -286,7 +275,6 @@
                         continue;
                     }
 
-                    // Route: RUF (forensic) vs RUA (aggregate)
                     isRUF = reFindNoCase("multipart/report", contentType)
                             AND reFindNoCase("report-type=feedback-report", contentType);
                     if (NOT isRUF) isRUF = reFindNoCase("feedback-report", msgBody);
@@ -314,7 +302,6 @@
                 }
             }
 
-            // Close connections
             if (useJavaMail) {
                 try { imapFolder.close(false); } catch(any e) {}
                 try { imapStore.close();        } catch(any e) {}
@@ -334,7 +321,6 @@
         } catch(any acctErr) {
             logLine("ACCOUNT ERROR (#acct.label#): #acctErr.message# | #acctErr.detail#", "ERROR");
             totalError++;
-            // Attempt to close connection if it was opened
             try { cfimap(action="close", connection=connLabel); } catch(any e) {}
             queryExecute("UPDATE imap_accounts SET last_status=? WHERE id=?",
                 [{value:"Error: " & left(acctErr.message,200), cfsqltype:"cf_sql_varchar"},{value:acct.id,cfsqltype:"cf_sql_integer"}],
