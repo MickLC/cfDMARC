@@ -3,17 +3,17 @@
       Included by poll.cfm when acct.auth_type EQ "oauth2".
 
       Expects (from poll.cfm scope):
-        acct        — current imap_accounts query row
-        logLine()   — logging function
-        totalNew    — running counter (mutated)
-        totalSkip   — running counter (mutated)
-        totalError  — running counter (mutated)
+        acct        - current imap_accounts query row
+        logLine()   - logging function
+        totalNew    - running counter (mutated)
+        totalSkip   - running counter (mutated)
+        totalError  - running counter (mutated)
 
       For each unprocessed message this file:
         1. Ensures a valid access token (refreshes if needed)
         2. Lists message IDs via Gmail API
         3. Fetches metadata only (headers, no payload) for deduplication
-        4. Skips already-seen messages cheaply — no full payload download
+        4. Skips already-seen messages cheaply - no full payload download
         5. Fetches full payload only for genuinely new messages
         6. Includes parse_rua.cfm or parse_ruf.cfm exactly as the doveadm path does
         7. Marks messages read and/or deletes them per poller settings
@@ -21,11 +21,11 @@
       Gmail API base: https://gmail.googleapis.com/gmail/v1/users/me
 
       Token storage columns (imap_accounts):
-        oauth_access_token   — AES-encrypted via encryptValue()
-        oauth_refresh_token  — AES-encrypted via encryptValue()
-        oauth_token_expiry   — TIMESTAMP (local server time)
-        oauth_client_id      — plaintext Google client ID
-        oauth_client_secret  — AES-encrypted Google client secret
+        oauth_access_token   - AES-encrypted via encryptValue()
+        oauth_refresh_token  - AES-encrypted via encryptValue()
+        oauth_token_expiry   - TIMESTAMP (local server time)
+        oauth_client_id      - plaintext Google client ID
+        oauth_client_secret  - AES-encrypted Google client secret
 
       Lucee gotchas observed in this file:
         - No var declarations at page scope (only inside functions)
@@ -38,9 +38,9 @@
           required by external APIs; use string literals for those payloads
 
       Gmail payload shapes observed in the wild:
-        A) multipart/* — payload.parts[] array, attachments inside parts
-        B) single-part with inline data — payload.body.data (base64url)
-        C) single-part with large attachment — payload.body.attachmentId,
+        A) multipart/* - payload.parts[] array, attachments inside parts
+        B) single-part with inline data - payload.body.data (base64url)
+        C) single-part with large attachment - payload.body.attachmentId,
            payload.body.data is absent or empty (Google DMARC reports use this)
       All three shapes are handled in the full-fetch branch.
 --->
@@ -163,9 +163,9 @@
 
         if (needRefresh) {
             if (NOT len(trim(acctRow.oauth_refresh_token)))
-                throw(type="GmailAPI", message="No refresh token stored — re-authorize the account via Admin > Accounts");
+                throw(type="GmailAPI", message="No refresh token stored - re-authorize the account via Admin > Accounts");
 
-            logLine("  Gmail: access token expired/missing — refreshing");
+            logLine("  Gmail: access token expired/missing - refreshing");
             var rt = decryptValue(acctRow.oauth_refresh_token);
             var cs = decryptValue(acctRow.oauth_client_secret);
             var ci = acctRow.oauth_client_id;
@@ -224,7 +224,7 @@
             return b64urlDecode(arguments.body.data);
         }
 
-        // Large attachment — no inline data, must fetch by attachmentId
+        // Large attachment - no inline data, must fetch by attachmentId
         if (structKeyExists(arguments.body, "attachmentId") AND len(arguments.body.attachmentId)) {
             var attData = gmailApiGet(
                 arguments.accessToken,
@@ -293,8 +293,8 @@
     // markGmailMessage(accessToken, gmailMsgId, markRead, deleteMsg)
     //
     // Applies disposition to a Gmail message after successful processing.
-    // markRead  — removes UNREAD label via the Gmail modify endpoint
-    // deleteMsg — moves to TRASH (Gmail doesn't hard-delete via API)
+    // markRead  - removes UNREAD label via the Gmail modify endpoint
+    // deleteMsg - moves to TRASH (Gmail doesn't hard-delete via API)
     //
     // Bug fix: do NOT use serializeJSON() to build the modify request body.
     // Lucee's serializeJSON() uppercases all struct keys, so
@@ -319,11 +319,9 @@
                 }
             } else if (arguments.markRead) {
                 var modEndpoint = "https://gmail.googleapis.com/gmail/v1/users/me/messages/#arguments.gmailMsgId#/modify";
-                <!---
-                    Hardcoded JSON string — do NOT replace with serializeJSON().
-                    Lucee uppercases struct keys, producing {"REMOVELABELIDS":["UNREAD"]}
-                    which the Gmail API ignores.  The literal string below is correct.
-                --->
+                // Hardcoded JSON string - do NOT replace with serializeJSON().
+                // Lucee uppercases struct keys, producing {"REMOVELABELIDS":["UNREAD"]}
+                // which the Gmail API ignores.  The literal string below is correct.
                 var modBody = '{"removeLabelIds":["UNREAD"]}';
                 cfhttp(url=modEndpoint, method="POST", result="modResp", timeout=15) {
                     cfhttpparam(type="header", name="Authorization",  value="Bearer #arguments.accessToken#");
@@ -341,12 +339,12 @@
     // Replaces the doveadm path for this account.
     //
     // Two-pass strategy per message:
-    //   Pass 1 (metadata): fetch headers only — cheap, used for dedup check.
-    //   Pass 2 (full):     fetch complete payload — only for new messages.
+    //   Pass 1 (metadata): fetch headers only - cheap, used for dedup check.
+    //   Pass 2 (full):     fetch complete payload - only for new messages.
     // This means already-processed messages cost one lightweight API call
     // instead of a full payload download, which matters during backlog drain.
     //
-    // IMPORTANT: No var declarations at page scope — Lucee only allows var
+    // IMPORTANT: No var declarations at page scope - Lucee only allows var
     // inside functions. All loop variables are plain assignments.
     // =======================================================================
 
@@ -362,7 +360,7 @@
     );
 
     if (NOT qGmailAcct.recordCount) {
-        logLine("  Gmail: account id=#acct.id# not found — skipping", "WARN");
+        logLine("  Gmail: account id=#acct.id# not found - skipping", "WARN");
     } else {
 
         gmailAcct = {
@@ -414,7 +412,7 @@
 
                     try {
 
-                        // Pass 1: metadata fetch — headers only, no payload.
+                        // Pass 1: metadata fetch - headers only, no payload.
                         // Much faster than format=full; used for dedup check only.
                         gmailMeta    = gmailApiGet(gmailToken, "messages/#gmailMsgId#", { "format": "metadata" });
                         metaHeaders  = structKeyExists(gmailMeta, "payload") AND structKeyExists(gmailMeta.payload, "headers")
@@ -424,7 +422,7 @@
                         cleanMsgId = reReplace(trim(rawMsgId), "[<>\s]", "", "ALL");
                         if (NOT len(cleanMsgId)) cleanMsgId = "gmail-" & gmailMsgId;
 
-                        // Dedup check — if already in DB, dispose and move on.
+                        // Dedup check - if already in DB, dispose and move on.
                         // No full payload download needed.
                         qDupe = queryExecute(
                             "SELECT id FROM report WHERE message_id=? LIMIT 1",
@@ -433,7 +431,7 @@
                         );
 
                         if (qDupe.recordCount) {
-                            logLine("  Gmail: #cleanMsgId# already in DB — skipping");
+                            logLine("  Gmail: #cleanMsgId# already in DB - skipping");
                             gmailSkip++;
                             totalSkip++;
                             markGmailMessage(gmailToken, gmailMsgId,
@@ -442,7 +440,7 @@
                             continue;
                         }
 
-                        // Pass 2: full fetch — only reached for new messages.
+                        // Pass 2: full fetch - only reached for new messages.
                         gmailMsg     = gmailApiGet(gmailToken, "messages/#gmailMsgId#", { "format": "full" });
                         gmailPayload = gmailMsg.payload ?: {};
                         gmailHeaders = structKeyExists(gmailPayload, "headers") ? gmailPayload.headers : [];
@@ -464,7 +462,7 @@
                         );
 
                         if (qDupe.recordCount) {
-                            logLine("  Gmail: #cleanMsgId# already in DB — skipping (full dedup)");
+                            logLine("  Gmail: #cleanMsgId# already in DB - skipping (full dedup)");
                             gmailSkip++;
                             totalSkip++;
                             markGmailMessage(gmailToken, gmailMsgId,
@@ -474,9 +472,9 @@
                         }
 
                         // Collect attachment bytes.
-                        // No var declarations — page scope, not function scope.
+                        // No var declarations - page scope, not function scope.
                         //
-                        // Shape A: multipart — walk parts[] tree
+                        // Shape A: multipart - walk parts[] tree
                         // Shape B: single-part with inline body.data
                         // Shape C: single-part with body.attachmentId (no body.data)
                         //          This is what Google DMARC reports use.
@@ -512,7 +510,7 @@
                             }
 
                         } else {
-                            logLine("  Gmail: msg=#gmailMsgId# unrecognised payload shape — mimeType=#topMime#", "WARN");
+                            logLine("  Gmail: msg=#gmailMsgId# unrecognised payload shape - mimeType=#topMime#", "WARN");
                         }
 
                         if (NOT arrayLen(attachments)) {
@@ -549,7 +547,7 @@
                         logLine("  Gmail ERROR msg=#gmailMsgId#: #msgErr.message# | #msgErr.detail#", "ERROR");
                         gmailError++;
                         totalError++;
-                        // No dispose on error — leave message intact
+                        // No dispose on error - leave message intact
                     }
 
                 } // end for gmailMessages

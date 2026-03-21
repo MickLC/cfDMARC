@@ -4,8 +4,8 @@
       Access control: caller must supply ?token= matching application.poller.token.
 
       Mailbox disposition after processing is controlled by two settings:
-        application.poller.markAsRead  (boolean) — set \Seen flag
-        application.poller.deleteAfter (boolean) — expunge after processing
+        application.poller.markAsRead  (boolean) - set \Seen flag
+        application.poller.deleteAfter (boolean) - expunge after processing
       deleteAfter only fires after a confirmed DB write (new) or confirmed
       duplicate skip; it never fires on error.
 
@@ -96,8 +96,8 @@
     // Given raw doveadm output sections, locate and base64-decode the DMARC
     // attachment bytes. Handles:
     //   Path 1: Top-level Content-Type is the attachment (Google single-part)
-    //   Path 2: multipart/* — split on boundary, find attachment MIME part
-    //   Path 3: fallback — try treating entire body as flat base64
+    //   Path 2: multipart/* - split on boundary, find attachment MIME part
+    //   Path 3: fallback - try treating entire body as flat base64
     //
     // Uses splitOnLiteral() for boundary splitting; listToArray() mishandles
     // multi-character delimiters by treating each char as a separate token.
@@ -210,13 +210,13 @@
             }
         }
 
-        // Path 2: multipart — split on boundary, find attachment part
+        // Path 2: multipart - split on boundary, find attachment part
         if (len(boundary)) {
             var result = processParts(splitOnLiteral(arguments.mimeBody, "--" & boundary));
             if (NOT isNull(result)) return result;
         }
 
-        // Path 3: fallback — try entire body as flat base64
+        // Path 3: fallback - try entire body as flat base64
         // Reaching here means no standard attachment path worked; log for diagnostics
         logLine("  MIME: unexpected structure CT=[#left(topCT,60)#] boundary=[#boundary#] bodyLen=#len(arguments.mimeBody)#", "WARN");
         try {
@@ -228,7 +228,7 @@
     }
 
     // -----------------------------------------------------------------------
-    // fetchViaDoveadm — retrieve raw hdr + body for one UID via doveadm.
+    // fetchViaDoveadm - retrieve raw hdr + body for one UID via doveadm.
     //
     // doveadm exits non-zero when a UID no longer exists (deleted between
     // cfimap listing and the doveadm call). We omit errorvariable to avoid
@@ -338,7 +338,9 @@
                 timeout    = 60
             );
 
-            <!--- Bug 1 fix: messageType="unread" limits fetch to unseen messages only --->
+            // Bug 1 fix: messageType="unread" limits fetch to unseen messages only.
+            // Without this the doveadm path fetches every message in the mailbox
+            // on every poll run instead of only new unread ones.
             cfimap(
                 action      = "getHeaderOnly",
                 connection  = "poll_#acct.id#",
@@ -369,7 +371,7 @@
                             [{value:quickMsgId, cfsqltype:"cf_sql_varchar"}],
                             {datasource:application.db.dsn});
                         if (qDupe.recordCount) {
-                            logLine("  uid=#msgUID# already in DB — skipping");
+                            logLine("  uid=#msgUID# already in DB - skipping");
                             totalSkip++;
                             disposeMessage("poll_#acct.id#", mailbox, msgUID);
                             continue;
@@ -396,7 +398,7 @@
                             logLine("  uid=#msgUID# extract error: #decErr.message#", "WARN");
                         }
                     } else {
-                        // doveadm returned nothing — UID was deleted after cfimap listed it
+                        // doveadm returned nothing - UID was deleted after cfimap listed it
                         totalSkip++;
                         continue;
                     }
@@ -409,7 +411,7 @@
                         [{value:cleanMsgId, cfsqltype:"cf_sql_varchar"}],
                         {datasource:application.db.dsn});
                     if (qDupe.recordCount) {
-                        logLine("  uid=#msgUID# duplicate — skipping");
+                        logLine("  uid=#msgUID# duplicate - skipping");
                         totalSkip++;
                         disposeMessage("poll_#acct.id#", mailbox, msgUID);
                         continue;
@@ -434,7 +436,7 @@
                 } catch(any msgErr) {
                     logLine("  ERROR uid=#msgUID#: #msgErr.message# | #msgErr.detail#", "ERROR");
                     totalError++;
-                    // No disposeMessage on error — leave the message intact
+                    // No disposeMessage on error - leave the message intact
                 }
             }
 
