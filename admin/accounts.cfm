@@ -46,79 +46,61 @@
                 pageError = "Label, host, and username are required.";
             } else {
 
-                // Encrypt sensitive values
-                newPwd      = len(trim(form.password))            ? encryptValue(trim(form.password))            : "";
-                newSecret   = len(trim(form.oauth_client_secret)) ? encryptValue(trim(form.oauth_client_secret)) : "";
+                // Encrypt sensitive values only when a new value was supplied.
+                // Empty string means "keep existing" on UPDATE.
+                newPwd    = len(trim(form.password))            ? encryptValue(trim(form.password))            : "";
+                newSecret = len(trim(form.oauth_client_secret)) ? encryptValue(trim(form.oauth_client_secret)) : "";
 
                 if (acctId GT 0) {
-                    // UPDATE — only overwrite password/secret if a new value was supplied
-                    if (len(newPwd) AND len(newSecret)) {
+                    // UPDATE — always save non-secret fields, then patch
+                    // password and/or oauth_client_secret independently
+                    // if a new value was supplied. This avoids the old
+                    // coupling where the secret was only saved when a
+                    // password was also provided.
+
+                    queryExecute(
+                        "UPDATE imap_accounts
+                         SET label=?, host=?, port=?, username=?,
+                             auth_type=?, use_ssl=?, mailbox=?, active=?,
+                             oauth_client_id=?
+                         WHERE id=?",
+                        [
+                            {value:left(trim(form.label),100),           cfsqltype:"cf_sql_varchar"},
+                            {value:left(trim(form.host),255),            cfsqltype:"cf_sql_varchar"},
+                            {value:val(form.port),                       cfsqltype:"cf_sql_integer"},
+                            {value:left(trim(form.username),255),        cfsqltype:"cf_sql_varchar"},
+                            {value:form.auth_type,                       cfsqltype:"cf_sql_varchar"},
+                            {value:val(form.use_ssl),                    cfsqltype:"cf_sql_tinyint"},
+                            {value:left(trim(form.mailbox),255),         cfsqltype:"cf_sql_varchar"},
+                            {value:val(form.active),                     cfsqltype:"cf_sql_tinyint"},
+                            {value:left(trim(form.oauth_client_id),255), cfsqltype:"cf_sql_varchar"},
+                            {value:acctId,                               cfsqltype:"cf_sql_integer"}
+                        ],
+                        {datasource:application.db.dsn}
+                    );
+
+                    if (len(newPwd)) {
                         queryExecute(
-                            "UPDATE imap_accounts
-                             SET label=?, host=?, port=?, username=?, password=?,
-                                 auth_type=?, use_ssl=?, mailbox=?, active=?,
-                                 oauth_client_id=?, oauth_client_secret=?
-                             WHERE id=?",
+                            "UPDATE imap_accounts SET password=? WHERE id=?",
                             [
-                                {value:left(trim(form.label),100),            cfsqltype:"cf_sql_varchar"},
-                                {value:left(trim(form.host),255),             cfsqltype:"cf_sql_varchar"},
-                                {value:val(form.port),                        cfsqltype:"cf_sql_integer"},
-                                {value:left(trim(form.username),255),         cfsqltype:"cf_sql_varchar"},
-                                {value:newPwd,                                cfsqltype:"cf_sql_varchar"},
-                                {value:form.auth_type,                        cfsqltype:"cf_sql_varchar"},
-                                {value:val(form.use_ssl),                     cfsqltype:"cf_sql_tinyint"},
-                                {value:left(trim(form.mailbox),255),          cfsqltype:"cf_sql_varchar"},
-                                {value:val(form.active),                      cfsqltype:"cf_sql_tinyint"},
-                                {value:left(trim(form.oauth_client_id),255),  cfsqltype:"cf_sql_varchar"},
-                                {value:newSecret,                             cfsqltype:"cf_sql_varchar"},
-                                {value:acctId,                                cfsqltype:"cf_sql_integer"}
-                            ],
-                            {datasource:application.db.dsn}
-                        );
-                    } else if (len(newPwd)) {
-                        queryExecute(
-                            "UPDATE imap_accounts
-                             SET label=?, host=?, port=?, username=?, password=?,
-                                 auth_type=?, use_ssl=?, mailbox=?, active=?,
-                                 oauth_client_id=?
-                             WHERE id=?",
-                            [
-                                {value:left(trim(form.label),100),           cfsqltype:"cf_sql_varchar"},
-                                {value:left(trim(form.host),255),            cfsqltype:"cf_sql_varchar"},
-                                {value:val(form.port),                       cfsqltype:"cf_sql_integer"},
-                                {value:left(trim(form.username),255),        cfsqltype:"cf_sql_varchar"},
-                                {value:newPwd,                               cfsqltype:"cf_sql_varchar"},
-                                {value:form.auth_type,                       cfsqltype:"cf_sql_varchar"},
-                                {value:val(form.use_ssl),                    cfsqltype:"cf_sql_tinyint"},
-                                {value:left(trim(form.mailbox),255),         cfsqltype:"cf_sql_varchar"},
-                                {value:val(form.active),                     cfsqltype:"cf_sql_tinyint"},
-                                {value:left(trim(form.oauth_client_id),255), cfsqltype:"cf_sql_varchar"},
-                                {value:acctId,                               cfsqltype:"cf_sql_integer"}
-                            ],
-                            {datasource:application.db.dsn}
-                        );
-                    } else {
-                        queryExecute(
-                            "UPDATE imap_accounts
-                             SET label=?, host=?, port=?, username=?,
-                                 auth_type=?, use_ssl=?, mailbox=?, active=?,
-                                 oauth_client_id=?
-                             WHERE id=?",
-                            [
-                                {value:left(trim(form.label),100),           cfsqltype:"cf_sql_varchar"},
-                                {value:left(trim(form.host),255),            cfsqltype:"cf_sql_varchar"},
-                                {value:val(form.port),                       cfsqltype:"cf_sql_integer"},
-                                {value:left(trim(form.username),255),        cfsqltype:"cf_sql_varchar"},
-                                {value:form.auth_type,                       cfsqltype:"cf_sql_varchar"},
-                                {value:val(form.use_ssl),                    cfsqltype:"cf_sql_tinyint"},
-                                {value:left(trim(form.mailbox),255),         cfsqltype:"cf_sql_varchar"},
-                                {value:val(form.active),                     cfsqltype:"cf_sql_tinyint"},
-                                {value:left(trim(form.oauth_client_id),255), cfsqltype:"cf_sql_varchar"},
-                                {value:acctId,                               cfsqltype:"cf_sql_integer"}
+                                {value:newPwd,   cfsqltype:"cf_sql_varchar"},
+                                {value:acctId,   cfsqltype:"cf_sql_integer"}
                             ],
                             {datasource:application.db.dsn}
                         );
                     }
+
+                    if (len(newSecret)) {
+                        queryExecute(
+                            "UPDATE imap_accounts SET oauth_client_secret=? WHERE id=?",
+                            [
+                                {value:newSecret, cfsqltype:"cf_sql_varchar"},
+                                {value:acctId,    cfsqltype:"cf_sql_integer"}
+                            ],
+                            {datasource:application.db.dsn}
+                        );
+                    }
+
                     pageMessage = "Account updated.";
                     auditLog("accounts.update", "id=#acctId# label=#form.label#");
 
