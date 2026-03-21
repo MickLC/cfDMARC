@@ -3,9 +3,18 @@
 
       Access control: caller must supply ?token= matching application.poller.token.
 
-      Uses Jakarta Mail (jakarta.mail) via plain createObject - Lucee registers
-      the service provider correctly when loaded this way. Loading from an explicit
-      JAR path bypasses the SPI service loader and breaks StreamProvider.
+      Architecture:
+        - cfimap getHeaderOnly  : list messages, get UIDs and Message-IDs
+        - doveadm fetch         : retrieve raw message body per UID
+        - CFML base64+decompress: decode the ZIP/GZ attachment in CFML
+
+      Why doveadm instead of Jakarta Mail:
+        Jakarta Mail's StreamProvider SPI cannot be bootstrapped from Lucee's
+        OSGi classloader context. doveadm runs as a local process and has no
+        classloader constraints.
+
+      Note: this approach only works for the local Dovecot account on Harry.
+      OAuth2/Gmail accounts would need a different fetch mechanism (future work).
 --->
 <cfinclude template="/includes/functions.cfm">
 
@@ -32,72 +41,69 @@
               type=(arguments.level EQ "ERROR" ? "error" : "information"));
     }
 
-    function streamToBytes(required any inputStream) {
-        var baos = createObject("java","java.io.ByteArrayOutputStream").init();
-        var buf  = createObject("java","java.lang.reflect.Array").newInstance(
-                       createObject("java","java.lang.Byte").TYPE, javaCast("int",8192));
-        var n = arguments.inputStream.read(buf);
-        while (n GT 0) {
-            baos.write(buf, javaCast("int",0), javaCast("int",n));
-            n = arguments.inputStream.read(buf);
-        }
-        arguments.inputStream.close();
-        return baos.toByteArray();
-    }
+    // Fetch raw body of a message via doveadm.
+    // Returns struct { body: "", headers: "", contentType: "", messageId: "" }
+    function fetchViaDoveadm(required string username, required string mailbox, required string uid) {
+        var result = { body:"", headers:"", contentType:"", messageId:"" };
 
-    // Walk a MIME Part recursively via Jakarta Mail.
-    // Collects every binary part regardless of Content-Disposition.
-    // Uses className string check instead of isInstanceOf to avoid
-    // cross-classloader instanceof failures.
-    // Returns struct { attachments: [], body: "" }
-    function walkPart(required any part) {
-        var result = { attachments: [], body: "" };
-        var ct   = "";
-        var disp = "";
-        try { ct   = javaCast("string", arguments.part.getContentType() ?: ""); } catch(any e) {}
-        try { disp = uCase(javaCast("string", arguments.part.getDisposition() ?: "")); } catch(any e) {}
+        // Fetch body (attachment content) and header
+        cfexecute(
+            name          = "/usr/bin/doveadm",
+            arguments     = 'fetch -u #arguments.username# "uid body header" mailbox #arguments.mailbox# uid #arguments.uid#',
+            variable      = "fetchOut",
+            errorvariable = "fetchErr",
+            timeout       = 30
+        );
 
-        var isBinary = reFindNoCase(
-            "(application/zip|application/gzip|application/x-gzip|application/octet-stream|text/xml|application/xml)", ct);
-
-        if (disp EQ "ATTACHMENT" OR isBinary) {
-            var fname = "";
-            try { fname = javaCast("string", arguments.part.getFileName() ?: ""); } catch(any e) {}
-            if (NOT len(trim(fname))) fname = "attachment";
-            try {
-                arrayAppend(result.attachments,
-                    { name: fname, bytes: streamToBytes(arguments.part.getInputStream()) });
-            } catch(any e) {}
-            return result;
+        if (len(trim(fetchErr))) {
+            logLine("  doveadm error for uid=#arguments.uid#: #left(fetchErr,200)#", "WARN");
         }
 
-        try {
-            var content   = arguments.part.getContent();
-            var className = content.getClass().getName();
-            if (findNoCase("Multipart", className)) {
-                for (var i = 0; i LT content.getCount(); i++) {
-                    var sub = walkPart(content.getBodyPart(i));
-                    for (var a in sub.attachments) arrayAppend(result.attachments, a);
-                    if (NOT len(result.body) AND len(sub.body)) result.body = sub.body;
-                }
-                return result;
+        // Parse doveadm output: sections separated by blank lines after "field: value" markers
+        // Format: "uid: N\nbody:\nBASE64DATA\nheader:\nHEADER TEXT\n"
+        var bodyStart   = reFindNoCase("(?m)^body:\s*\n", fetchOut);
+        var headerStart = reFindNoCase("(?m)^header:\s*\n", fetchOut);
+
+        if (bodyStart GT 0) {
+            var afterBodyLabel = bodyStart + len(reMatch("(?m)^body:\s*\n", fetchOut)[1]);
+            if (headerStart GT 0 AND headerStart GT afterBodyLabel) {
+                result.body = trim(mid(fetchOut, afterBodyLabel, headerStart - afterBodyLabel));
+            } else {
+                result.body = trim(mid(fetchOut, afterBodyLabel, len(fetchOut) - afterBodyLabel + 1));
             }
-            if (reFindNoCase("text/(plain|html)", ct)) {
-                result.body = javaCast("string", content ?: "");
-            }
-        } catch(any e) {}
+        }
+
+        if (headerStart GT 0) {
+            var afterHeaderLabel = headerStart + len(reMatch("(?m)^header:\s*\n", fetchOut)[1]);
+            result.headers = trim(mid(fetchOut, afterHeaderLabel, len(fetchOut) - afterHeaderLabel + 1));
+        }
+
+        // Extract Content-Type from headers
+        var ctMatch = reFind("(?i)Content-Type:\s*([^\r\n]+)", result.headers, 1, true);
+        if (ctMatch.len[1] GT 0 AND arrayLen(ctMatch.len) GT 1)
+            result.contentType = trim(mid(result.headers, ctMatch.pos[2], ctMatch.len[2]));
+
+        // Extract Message-ID from headers
+        var midMatch = reFind("(?i)Message-ID:\s*([^\r\n]+)", result.headers, 1, true);
+        if (midMatch.len[1] GT 0 AND arrayLen(midMatch.len) GT 1)
+            result.messageId = trim(mid(result.headers, midMatch.pos[2], midMatch.len[2]));
 
         return result;
+    }
+
+    // Decode base64 body string to byte array
+    function base64ToBytes(required string b64) {
+        // Strip whitespace from base64 string
+        var clean = reReplace(arguments.b64, "\s+", "", "ALL");
+        if (NOT len(clean)) return javaCast("null","");
+        return createObject("java","java.util.Base64").getDecoder().decode(clean);
     }
 
     logLine("=== Poll run started ===");
 
     qAccounts = queryExecute(
         "SELECT id, label, host, port, username,
-                password, auth_type,
-                oauth_access_token, oauth_refresh_token,
-                oauth_client_id, oauth_client_secret,
-                oauth_token_expiry, use_ssl, mailbox
+                password, auth_type, use_ssl, mailbox
          FROM   imap_accounts
          WHERE  active = 1
          ORDER  BY id",
@@ -111,116 +117,90 @@
         logLine("--- Account: #acct.label# (#acct.username#) ---");
 
         try {
-
-            imapPassword = "";
-
+            // ----------------------------------------------------------
+            // Only doveadm-accessible accounts supported for now
+            // (local Dovecot accounts on this server)
+            // ----------------------------------------------------------
             if (acct.auth_type EQ "oauth2") {
-                needRefresh = NOT isDate(acct.oauth_token_expiry)
-                              OR dateDiff("n", now(), acct.oauth_token_expiry) LT 5;
-                if (needRefresh) {
-                    logLine("Refreshing OAuth2 access token");
-                    refreshToken = decryptValue(acct.oauth_refresh_token);
-                    clientId     = acct.oauth_client_id;
-                    clientSecret = decryptValue(acct.oauth_client_secret);
-                    if (NOT len(refreshToken) OR NOT len(clientId) OR NOT len(clientSecret)) {
-                        logLine("Missing OAuth2 credentials — skipping", "ERROR");
-                        totalError++;
-                        queryExecute("UPDATE imap_accounts SET last_status=? WHERE id=?",
-                            [{value:"Error: missing OAuth2 credentials",cfsqltype:"cf_sql_varchar"},{value:acct.id,cfsqltype:"cf_sql_integer"}],
-                            {datasource:application.db.dsn});
-                        continue;
-                    }
-                    cfhttp(url="https://oauth2.googleapis.com/token", method="POST", result="tokenResp") {
-                        cfhttpparam(type="formfield", name="client_id",     value=clientId);
-                        cfhttpparam(type="formfield", name="client_secret", value=clientSecret);
-                        cfhttpparam(type="formfield", name="refresh_token", value=refreshToken);
-                        cfhttpparam(type="formfield", name="grant_type",    value="refresh_token");
-                    }
-                    tokenData = deserializeJSON(tokenResp.fileContent);
-                    if (NOT structKeyExists(tokenData, "access_token")) {
-                        logLine("Token refresh failed: #tokenResp.fileContent#", "ERROR");
-                        totalError++;
-                        queryExecute("UPDATE imap_accounts SET last_status=? WHERE id=?",
-                            [{value:"Error: token refresh failed",cfsqltype:"cf_sql_varchar"},{value:acct.id,cfsqltype:"cf_sql_integer"}],
-                            {datasource:application.db.dsn});
-                        continue;
-                    }
-                    newExpiry = dateAdd("s", val(tokenData.expires_in ?: 3599), now());
-                    queryExecute(
-                        "UPDATE imap_accounts SET oauth_access_token=?, oauth_token_expiry=? WHERE id=?",
-                        [
-                            {value:encryptValue(tokenData.access_token), cfsqltype:"cf_sql_varchar"},
-                            {value:newExpiry,                            cfsqltype:"cf_sql_timestamp"},
-                            {value:acct.id,                              cfsqltype:"cf_sql_integer"}
-                        ],
-                        {datasource:application.db.dsn}
-                    );
-                    imapPassword = tokenData.access_token;
-                } else {
-                    imapPassword = decryptValue(acct.oauth_access_token);
-                }
-            } else {
-                imapPassword = decryptValue(acct.password);
-            }
-
-            if (NOT len(imapPassword)) {
-                logLine("Empty credential — skipping", "ERROR");
-                totalError++;
+                logLine("  OAuth2 accounts not yet supported via doveadm path — skipping", "WARN");
                 continue;
             }
 
-            mailbox  = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
-            protocol = acct.use_ssl ? "imaps" : "imap";
+            mailbox = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
 
-            props = createObject("java","java.util.Properties").init();
-            props.setProperty("mail.store.protocol", protocol);
-            props.setProperty("mail.#protocol#.host", acct.host);
-            props.setProperty("mail.#protocol#.port", javaCast("string", acct.port));
-            props.setProperty("mail.#protocol#.ssl.enable", acct.use_ssl ? "true" : "false");
+            // Get header list via cfimap (just needs UIDs and Message-IDs)
+            imapPassword = decryptValue(acct.password);
 
-            if (acct.auth_type EQ "oauth2") {
-                props.setProperty("mail.#protocol#.auth.mechanisms", "XOAUTH2");
-                props.setProperty("mail.#protocol#.sasl.enable",     "true");
-                props.setProperty("mail.#protocol#.sasl.mechanisms", "XOAUTH2");
-                connectPassword = toBase64(
-                    "user=#acct.username#" & chr(1) & "auth=Bearer #imapPassword#" & chr(1) & chr(1)
-                );
-            } else {
-                connectPassword = imapPassword;
-            }
+            cfimap(
+                action     = "open",
+                connection = "poll_#acct.id#",
+                server     = acct.host,
+                port       = acct.port,
+                username   = acct.username,
+                password   = imapPassword,
+                secure     = (acct.use_ssl ? true : false),
+                timeout    = 60
+            );
 
-            // Plain createObject — Lucee's service loader registers StreamProvider correctly
-            jSession   = createObject("java","jakarta.mail.Session").getInstance(props);
-            imapStore  = jSession.getStore(protocol);
-            imapStore.connect(acct.host, acct.username, connectPassword);
-            imapFolder = imapStore.getFolder(mailbox);
-            imapFolder.open(javaCast("int", 2)); // READ_WRITE = 2
+            cfimap(
+                action     = "getHeaderOnly",
+                connection = "poll_#acct.id#",
+                folder     = mailbox,
+                name       = "qHeaders",
+                maxRows    = application.poller.batchSize
+            );
 
-            jMessages = imapFolder.getMessages();
-            msgCount  = arrayLen(jMessages);
-            startIdx  = max(1, msgCount - application.poller.batchSize + 1);
-            logLine("#msgCount# message(s); processing #(msgCount - startIdx + 1)#");
+            msgCount = qHeaders.recordCount;
+            logLine("#msgCount# message(s) in mailbox");
 
-            for (msgIdx = startIdx; msgIdx LTE msgCount; msgIdx++) {
+            for (msgIdx = 1; msgIdx LTE msgCount; msgIdx++) {
 
                 try {
-                    jMsg        = jMessages[msgIdx - 1];
-                    msgSubject  = javaCast("string", jMsg.getSubject() ?: "");
-                    contentType = javaCast("string", jMsg.getContentType() ?: "");
+                    msgUID     = qHeaders.uid[msgIdx];
+                    msgSubject = qHeaders.subject[msgIdx];
 
-                    msgMessageId = "";
-                    try {
-                        hdrs = jMsg.getHeader("Message-ID");
-                        if (NOT isNull(hdrs) AND arrayLen(hdrs) GT 0)
-                            msgMessageId = javaCast("string", hdrs[1]);
-                    } catch(any e) {}
-                    if (NOT len(msgMessageId)) msgMessageId = createUUID();
+                    // Quick dedup check using Message-ID from headers
+                    // cfimap getHeaderOnly returns a header column with raw headers
+                    rawHdr    = qHeaders.header[msgIdx];
+                    midMatch  = reFind("(?i)Message-ID:\s*([^\r\n]+)", rawHdr, 1, true);
+                    quickMsgId = "";
+                    if (midMatch.len[1] GT 0 AND arrayLen(midMatch.len) GT 1)
+                        quickMsgId = reReplace(trim(mid(rawHdr, midMatch.pos[2], midMatch.len[2])), "[<>\s]", "", "ALL");
 
-                    parsed      = walkPart(jMsg);
-                    attachments = parsed.attachments;
-                    msgBody     = parsed.body;
+                    if (len(quickMsgId)) {
+                        qDupe = queryExecute("SELECT id FROM report WHERE message_id=? LIMIT 1",
+                            [{value:quickMsgId, cfsqltype:"cf_sql_varchar"}],
+                            {datasource:application.db.dsn});
+                        if (qDupe.recordCount) {
+                            logLine("  uid=#msgUID# duplicate — skipping");
+                            totalSkip++;
+                            if (application.poller.markAsRead)
+                                try { cfimap(action="markRead", connection="poll_#acct.id#", folder=mailbox, uid=msgUID); } catch(any e) {}
+                            continue;
+                        }
+                    }
 
-                    logLine("  msg##msgIdx attachments=#arrayLen(attachments)# subject=#left(msgSubject,60)#");
+                    logLine("  uid=#msgUID# fetching body...");
+
+                    // Fetch full message via doveadm
+                    fetched     = fetchViaDoveadm(acct.username, mailbox, msgUID);
+                    contentType = len(fetched.contentType) ? fetched.contentType : "";
+                    msgBody     = "";
+                    attachments = [];
+                    msgMessageId = len(fetched.messageId) ? fetched.messageId : (len(quickMsgId) ? quickMsgId : createUUID());
+
+                    // The body from doveadm is base64-encoded attachment content
+                    if (len(trim(fetched.body))) {
+                        try {
+                            rawBytes = base64ToBytes(fetched.body);
+                            if (NOT isNull(rawBytes) AND arrayLen(rawBytes) GT 1) {
+                                attachments = [{ name: "report", bytes: rawBytes }];
+                                logLine("  uid=#msgUID# decoded #arrayLen(rawBytes)# bytes");
+                            }
+                        } catch(any decErr) {
+                            logLine("  uid=#msgUID# base64 decode error: #decErr.message#", "WARN");
+                        }
+                    }
 
                     cleanMsgId = reReplace(trim(msgMessageId), "[<>\s]", "", "ALL");
                     if (NOT len(cleanMsgId)) cleanMsgId = createUUID();
@@ -232,40 +212,36 @@
                     if (qDupe.recordCount) {
                         logLine("  Duplicate — skipping");
                         totalSkip++;
-                        if (application.poller.markAsRead) {
-                            var seenFlag = createObject("java","jakarta.mail.Flags$Flag").SEEN;
-                            jMsg.setFlag(seenFlag, javaCast("boolean", true));
-                        }
+                        if (application.poller.markAsRead)
+                            try { cfimap(action="markRead", connection="poll_#acct.id#", folder=mailbox, uid=msgUID); } catch(any e) {}
                         continue;
                     }
 
+                    // Route RUF vs RUA
                     isRUF = reFindNoCase("multipart/report", contentType)
                             AND reFindNoCase("report-type=feedback-report", contentType);
-                    if (NOT isRUF) isRUF = reFindNoCase("feedback-report", msgBody);
+                    if (NOT isRUF AND len(msgBody)) isRUF = reFindNoCase("feedback-report", msgBody);
 
                     if (isRUF) {
                         logLine("  -> RUF");
                         include "/poller/parse_ruf.cfm";
                     } else {
-                        logLine("  -> RUA");
+                        logLine("  -> RUA (subject: #left(msgSubject,80)#)");
                         include "/poller/parse_rua.cfm";
                     }
 
-                    if (application.poller.markAsRead) {
-                        var seenFlag = createObject("java","jakarta.mail.Flags$Flag").SEEN;
-                        jMsg.setFlag(seenFlag, javaCast("boolean", true));
-                    }
+                    if (application.poller.markAsRead)
+                        try { cfimap(action="markRead", connection="poll_#acct.id#", folder=mailbox, uid=msgUID); } catch(any e) {}
 
                     totalNew++;
 
                 } catch(any msgErr) {
-                    logLine("  ERROR msg##msgIdx: #msgErr.message# | #msgErr.detail#", "ERROR");
+                    logLine("  ERROR uid=#msgUID#: #msgErr.message# | #msgErr.detail#", "ERROR");
                     totalError++;
                 }
             }
 
-            try { imapFolder.close(false); } catch(any e) {}
-            try { imapStore.close();        } catch(any e) {}
+            try { cfimap(action="close", connection="poll_#acct.id#"); } catch(any e) {}
 
             queryExecute(
                 "UPDATE imap_accounts SET last_polled=NOW(), last_status=? WHERE id=?",
@@ -279,8 +255,7 @@
         } catch(any acctErr) {
             logLine("ACCOUNT ERROR (#acct.label#): #acctErr.message# | #acctErr.detail#", "ERROR");
             totalError++;
-            try { imapFolder.close(false); } catch(any e) {}
-            try { imapStore.close();        } catch(any e) {}
+            try { cfimap(action="close", connection="poll_#acct.id#"); } catch(any e) {}
             queryExecute("UPDATE imap_accounts SET last_status=? WHERE id=?",
                 [{value:"Error: " & left(acctErr.message,200), cfsqltype:"cf_sql_varchar"},{value:acct.id,cfsqltype:"cf_sql_integer"}],
                 {datasource:application.db.dsn});
