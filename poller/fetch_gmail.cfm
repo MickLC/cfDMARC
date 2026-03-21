@@ -26,8 +26,13 @@
         oauth_client_id      — plaintext Google client ID
         oauth_client_secret  — AES-encrypted Google client secret
 
-      Lucee page-scope gotcha: do NOT use var declarations outside a function.
-      All variables in the main loop body are plain assignments.
+      Lucee gotchas observed in this file:
+        - No var declarations at page scope (only inside functions)
+        - Local variable named apiEndpoint (not url) to avoid URL scope collision
+          inside cfhttp tag attributes
+        - Unquoted struct keys with underscores get uppercased/mangled by Lucee;
+          token refresh POST uses explicit cfhttpparam calls instead of a struct
+        - Struct keys used as cfhttpparam names are quoted strings to be safe
 --->
 <cfscript>
 
@@ -36,9 +41,6 @@
     //
     // GET https://gmail.googleapis.com/gmail/v1/users/me/{apiPath}
     // Returns deserialized JSON struct, or throws on HTTP error.
-    //
-    // NOTE: local variable named apiEndpoint (not url) to avoid collision
-    // with Lucee's built-in URL scope inside cfhttp tag attributes.
     // -----------------------------------------------------------------------
     function gmailApiGet(
         required string accessToken,
@@ -72,30 +74,13 @@
     }
 
     // -----------------------------------------------------------------------
-    // gmailApiPost(postUrl, fields)
-    //
-    // POST to an arbitrary URL (used for token refresh only).
-    // Returns deserialized JSON struct.
-    // -----------------------------------------------------------------------
-    function gmailApiPost(required string postUrl, required struct fields) {
-        cfhttp(url=arguments.postUrl, method="POST", result="gmailPostResp", timeout=30) {
-            for (var k in arguments.fields) {
-                cfhttpparam(type="formfield", name=k, value=arguments.fields[k]);
-            }
-        }
-        if (NOT isJSON(gmailPostResp.fileContent)) {
-            throw(type="GmailAPI",
-                  message="Non-JSON response from token endpoint",
-                  detail=left(gmailPostResp.fileContent, 200));
-        }
-        return deserializeJSON(gmailPostResp.fileContent);
-    }
-
-    // -----------------------------------------------------------------------
     // refreshGmailToken(acctId, refreshToken, clientId, clientSecret)
     //
     // Exchanges a refresh token for a new access token and writes it back
     // to imap_accounts.  Returns the new plaintext access token.
+    //
+    // Uses explicit cfhttpparam calls rather than a struct to avoid Lucee
+    // mangling underscore-containing keys (grant_type, refresh_token, etc.).
     // -----------------------------------------------------------------------
     function refreshGmailToken(
         required numeric acctId,
@@ -103,15 +88,25 @@
         required string  clientId,
         required string  clientSecret
     ) {
-        var resp = gmailApiPost(
-            "https://oauth2.googleapis.com/token",
-            {
-                grant_type    : "refresh_token",
-                refresh_token : arguments.refreshToken,
-                client_id     : arguments.clientId,
-                client_secret : arguments.clientSecret
-            }
-        );
+        cfhttp(
+            url    = "https://oauth2.googleapis.com/token",
+            method = "POST",
+            result = "refreshResp",
+            timeout = 30
+        ) {
+            cfhttpparam(type="formfield", name="grant_type",    value="refresh_token");
+            cfhttpparam(type="formfield", name="refresh_token", value=arguments.refreshToken);
+            cfhttpparam(type="formfield", name="client_id",     value=arguments.clientId);
+            cfhttpparam(type="formfield", name="client_secret", value=arguments.clientSecret);
+        }
+
+        if (NOT isJSON(refreshResp.fileContent)) {
+            throw(type="GmailAPI",
+                  message="Non-JSON response from token endpoint",
+                  detail=left(refreshResp.fileContent, 200));
+        }
+
+        var resp = deserializeJSON(refreshResp.fileContent);
 
         if (NOT structKeyExists(resp, "access_token")) {
             var errMsg = structKeyExists(resp, "error_description") ? resp.error_description : serializeJSON(resp);
@@ -233,13 +228,11 @@
             }
 
             // Is this a DMARC attachment?
-            // Match on MIME type OR filename extension — whichever fires first.
             var isDmarc = false;
             if (reFindNoCase("application/(zip|gzip|x-zip|x-zip-compressed|x-gzip|octet-stream|xml)", mimeType)) isDmarc = true;
             if (reFindNoCase("\.(zip|gz|xml)$", filename)) isDmarc = true;
 
             if (NOT isDmarc) {
-                // Log unrecognised parts at DEBUG level so we can diagnose misses
                 if (len(filename) OR len(mimeType))
                     logLine("  Gmail: skipping part mime=#mimeType# file=#filename# msg=#arguments.gmailMsgId#", "INFO");
                 continue;
@@ -249,15 +242,13 @@
 
             try {
                 if (structKeyExists(part, "body")) {
-                    var body = part.body;
+                    var body       = part.body;
                     var attachSize = val(body.size ?: 0);
 
                     if (structKeyExists(body, "data") AND len(body.data)) {
-                        // Inline base64url data
                         bodyBytes = b64urlDecode(body.data);
 
                     } else if (structKeyExists(body, "attachmentId") AND len(body.attachmentId)) {
-                        // Large attachment — fetch separately by attachmentId
                         logLine("  Gmail: fetching attachment id=#body.attachmentId# size=#attachSize# msg=#arguments.gmailMsgId#", "INFO");
                         var attData = gmailApiGet(
                             arguments.accessToken,
@@ -342,14 +333,14 @@
     } else {
 
         gmailAcct = {
-            id                  : qGmailAcct.id,
-            label               : qGmailAcct.label,
-            username            : qGmailAcct.username,
-            oauth_client_id     : qGmailAcct.oauth_client_id,
-            oauth_client_secret : qGmailAcct.oauth_client_secret,
-            oauth_access_token  : qGmailAcct.oauth_access_token,
-            oauth_refresh_token : qGmailAcct.oauth_refresh_token,
-            oauth_token_expiry  : qGmailAcct.oauth_token_expiry
+            "id"                  : qGmailAcct.id,
+            "label"               : qGmailAcct.label,
+            "username"            : qGmailAcct.username,
+            "oauth_client_id"     : qGmailAcct.oauth_client_id,
+            "oauth_client_secret" : qGmailAcct.oauth_client_secret,
+            "oauth_access_token"  : qGmailAcct.oauth_access_token,
+            "oauth_refresh_token" : qGmailAcct.oauth_refresh_token,
+            "oauth_token_expiry"  : qGmailAcct.oauth_token_expiry
         };
 
         try {
@@ -357,10 +348,11 @@
             // Step 1: get a live access token
             gmailToken = getValidAccessToken(gmailAcct);
 
-            // Step 2: list unread messages in INBOX (batch-limited)
+            // Step 2: list unread messages in INBOX (batch-limited).
+            // Quoted keys to avoid Lucee mangling underscored keys in struct literals.
             gmailListParams = {
-                q          : "in:inbox is:unread",
-                maxResults : application.poller.batchSize
+                "q"          : "in:inbox is:unread",
+                "maxResults" : application.poller.batchSize
             };
 
             gmailList = gmailApiGet(gmailToken, "messages", gmailListParams);
@@ -394,7 +386,7 @@
                         gmailMsg = gmailApiGet(
                             gmailToken,
                             "messages/#gmailMsgId#",
-                            { format: "full" }
+                            { "format": "full" }
                         );
 
                         gmailPayload = gmailMsg.payload ?: {};
@@ -446,7 +438,6 @@
                                     arrayAppend(attachments, { name: "report", bytes: topBytes });
                             }
                         } else {
-                            // No parts array and no body data — log payload shape for diagnosis
                             logLine("  Gmail: msg=#gmailMsgId# has no parts[] and no body.data — mimeType=#lCase(gmailPayload.mimeType ?: 'unknown')#", "WARN");
                         }
 
@@ -454,7 +445,6 @@
                             logLine("  Gmail: no attachment bytes for msg=#gmailMsgId# sub=#left(msgSubject,60)#", "WARN");
                             gmailSkip++;
                             totalSkip++;
-                            // Still dispose — not a parseable DMARC message
                             markGmailMessage(gmailToken, gmailMsgId,
                                 application.poller.markAsRead,
                                 structKeyExists(application.poller, "deleteAfter") AND application.poller.deleteAfter);
