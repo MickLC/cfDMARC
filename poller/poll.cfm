@@ -3,6 +3,12 @@
 
       Access control: caller must supply ?token= matching application.poller.token.
 
+      Mailbox disposition after processing is controlled by two settings:
+        application.poller.markAsRead  (boolean) — set \Seen flag
+        application.poller.deleteAfter (boolean) — expunge after processing
+      deleteAfter only fires after a confirmed DB write (new) or confirmed
+      duplicate skip; it never fires on error.
+
       Architecture:
         - cfimap getHeaderOnly  : list messages, get UIDs and Message-IDs for dedup
         - doveadm fetch         : retrieve hdr + body per UID (fields: "hdr body")
@@ -40,6 +46,28 @@
         arrayAppend(pollLog, "[#ts#] [#arguments.level#] #arguments.msg#");
         cflog(file="dmarc_poller", text="[#arguments.level#] #arguments.msg#",
               type=(arguments.level EQ "ERROR" ? "error" : "information"));
+    }
+
+    // -----------------------------------------------------------------------
+    // disposeMessage(connection, mailbox, uid)
+    //
+    // Called after a message has been successfully handled (inserted or confirmed
+    // duplicate). Applies markAsRead and/or deleteAfter per settings.
+    // Never called on error paths so we never discard a message we failed to store.
+    // -----------------------------------------------------------------------
+    function disposeMessage(required string connection, required string mailbox, required string uid) {
+        if (application.poller.markAsRead) {
+            try {
+                cfimap(action="markRead", connection=arguments.connection,
+                       folder=arguments.mailbox, uid=arguments.uid);
+            } catch(any e) {}
+        }
+        if (structKeyExists(application.poller, "deleteAfter") AND application.poller.deleteAfter) {
+            try {
+                cfimap(action="delete", connection=arguments.connection,
+                       folder=arguments.mailbox, uid=arguments.uid);
+            } catch(any e) {}
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -333,8 +361,7 @@
                         if (qDupe.recordCount) {
                             logLine("  uid=#msgUID# already in DB — skipping");
                             totalSkip++;
-                            if (application.poller.markAsRead)
-                                try { cfimap(action="markRead", connection="poll_#acct.id#", folder=mailbox, uid=msgUID); } catch(any e) {}
+                            disposeMessage("poll_#acct.id#", mailbox, msgUID);
                             continue;
                         }
                     }
@@ -374,8 +401,7 @@
                     if (qDupe.recordCount) {
                         logLine("  uid=#msgUID# duplicate — skipping");
                         totalSkip++;
-                        if (application.poller.markAsRead)
-                            try { cfimap(action="markRead", connection="poll_#acct.id#", folder=mailbox, uid=msgUID); } catch(any e) {}
+                        disposeMessage("poll_#acct.id#", mailbox, msgUID);
                         continue;
                     }
 
@@ -391,14 +417,14 @@
                         include "/poller/parse_rua.cfm";
                     }
 
-                    if (application.poller.markAsRead)
-                        try { cfimap(action="markRead", connection="poll_#acct.id#", folder=mailbox, uid=msgUID); } catch(any e) {}
-
+                    // Only dispose after confirmed DB write (parse_rua/ruf succeeded)
+                    disposeMessage("poll_#acct.id#", mailbox, msgUID);
                     totalNew++;
 
                 } catch(any msgErr) {
                     logLine("  ERROR uid=#msgUID#: #msgErr.message# | #msgErr.detail#", "ERROR");
                     totalError++;
+                    // No disposeMessage on error — leave the message intact
                 }
             }
 
