@@ -6,17 +6,26 @@
 
 <cfscript>
     param name="url.action" default="";
-    pageMessage = "";
+    pageMessage      = "";
+    pageMessageClass = "alert-info";
+    pollErrorBody    = "";
 
     if (url.action EQ "run") {
         try {
             pollURL = application.baseURL & "/poller/poll.cfm?token=" & urlEncodedFormat(application.poller.token);
             cfhttp(url=pollURL, method="GET", timeout=300, result="pollResult");
-            pageMessage = find("OK:", pollResult.fileContent)
-                ? "Poll complete: #htmlEditFormat(trim(pollResult.fileContent))#"
-                : "Unexpected response. Check dmarc_poller log. Response: #htmlEditFormat(left(pollResult.fileContent,200))#";
+            httpStatus = pollResult.responseHeader["Status_Code"] ?: "?";
+            if (find("OK:", pollResult.fileContent)) {
+                pageMessage      = "Poll complete: #htmlEditFormat(trim(pollResult.fileContent))#";
+                pageMessageClass = "alert-success";
+            } else {
+                pageMessage      = "Unexpected response (HTTP #htmlEditFormat(httpStatus)#). Check dmarc_poller log.";
+                pageMessageClass = "alert-danger";
+                pollErrorBody    = pollResult.fileContent;
+            }
         } catch(any e) {
-            pageMessage = "Poll error: #e.message#";
+            pageMessage      = "Poll error: #htmlEditFormat(e.message)#";
+            pageMessageClass = "alert-danger";
         }
     }
 
@@ -43,7 +52,20 @@
 <cfoutput>
 
 <cfif len(pageMessage)>
-<div class="alert alert-info mb-3"><i class="bi bi-info-circle"></i> #pageMessage#</div>
+<div class="alert #pageMessageClass# mb-3">
+    <i class="bi bi-#(pageMessageClass EQ 'alert-success' ? 'check-circle' : 'exclamation-triangle')#"></i>
+    #pageMessage#
+    <cfif len(pollErrorBody)>
+        <div class="mt-2">
+            <a href="##" class="alert-link" style="font-size:0.85rem;"
+               onclick="document.getElementById('poll-error-body').classList.toggle('d-none');return false;">
+                Show / hide full response
+            </a>
+        </div>
+        <pre id="poll-error-body" class="d-none mt-2 p-2"
+             style="font-size:0.72rem;background:var(--bg-primary);border:1px solid var(--border-color);border-radius:4px;max-height:400px;overflow:auto;white-space:pre-wrap;word-break:break-all;">#htmlEditFormat(pollErrorBody)#</pre>
+    </cfif>
+</div>
 </cfif>
 
 <div class="d-flex gap-2 mb-4">
