@@ -13,27 +13,19 @@
 <cfscript>
 
     function extractXmlFromBytes(required any rawBytes) {
-        // Sniff magic bytes (Java bytes are signed; cast to int to get 0-255 range)
-        // GZip: 0x1F 0x8B   ZIP: 0x50 0x4B
-        var b0 = rawBytes[1];
-        var b1 = rawBytes[2];
-        // Convert signed byte to unsigned int for reliable comparison
-        if (b0 LT 0) b0 = b0 + 256;
-        if (b1 LT 0) b1 = b1 + 256;
+        // Java bytes are signed (-128..127); normalize to 0-255 for magic byte comparison
+        var b0 = rawBytes[1]; if (b0 LT 0) b0 = b0 + 256;
+        var b1 = rawBytes[2]; if (b1 LT 0) b1 = b1 + 256;
 
         if (b0 EQ 31 AND b1 EQ 139) {
             // GZIP
-            var bis = createObject("java","java.io.ByteArrayInputStream").init(rawBytes);
-            var gis = createObject("java","java.util.zip.GZIPInputStream").init(bis);
-            var sr  = createObject("java","java.io.InputStreamReader").init(gis, "UTF-8");
-            var br  = createObject("java","java.io.BufferedReader").init(sr);
-            var sb  = createObject("java","java.lang.StringBuilder").init();
+            var bis  = createObject("java","java.io.ByteArrayInputStream").init(rawBytes);
+            var gis  = createObject("java","java.util.zip.GZIPInputStream").init(bis);
+            var sr   = createObject("java","java.io.InputStreamReader").init(gis, "UTF-8");
+            var br   = createObject("java","java.io.BufferedReader").init(sr);
+            var sb   = createObject("java","java.lang.StringBuilder").init();
             var line = br.readLine();
-            while (NOT isNull(line)) {
-                sb.append(line);
-                sb.append(chr(10));
-                line = br.readLine();
-            }
+            while (NOT isNull(line)) { sb.append(line); sb.append(chr(10)); line = br.readLine(); }
             br.close();
             return sb.toString();
 
@@ -49,11 +41,7 @@
                     var br   = createObject("java","java.io.BufferedReader").init(sr);
                     var sb   = createObject("java","java.lang.StringBuilder").init();
                     var line = br.readLine();
-                    while (NOT isNull(line)) {
-                        sb.append(line);
-                        sb.append(chr(10));
-                        line = br.readLine();
-                    }
+                    while (NOT isNull(line)) { sb.append(line); sb.append(chr(10)); line = br.readLine(); }
                     zis.close();
                     return sb.toString();
                 }
@@ -63,7 +51,7 @@
             throw(type="DMARCPoller", message="No XML entry found in ZIP attachment");
 
         } else {
-            // Assume raw UTF-8 XML
+            // Assume raw UTF-8 XML (e.g. some senders send uncompressed XML)
             return createObject("java","java.lang.String").init(rawBytes, "UTF-8");
         }
     }
@@ -78,16 +66,11 @@
             }
             if (isStruct(current) AND structKeyExists(current, "XmlText")) return trim(current.XmlText);
             return arguments.defaultVal;
-        } catch(any e) {
-            return arguments.defaultVal;
-        }
+        } catch(any e) { return arguments.defaultVal; }
     }
 
     // -------------------------------------------------------------------
-    // Find and decompress the XML attachment
-    // attachments is set by poll.cfm as [{ name: "report", bytes: rawBytes }]
-    // Process any attachment that has a bytes key — the MIME filtering was
-    // already done upstream in extractDmarcAttachment().
+    // Decompress XML from attachment bytes
     // -------------------------------------------------------------------
     xmlContent = "";
 
@@ -95,13 +78,12 @@
         if (structKeyExists(att, "bytes") AND NOT isNull(att.bytes) AND arrayLen(att.bytes) GT 4) {
             try {
                 xmlContent = extractXmlFromBytes(att.bytes);
-                // Sanity check: must look like XML
                 if (NOT reFindNoCase("^\s*<\?xml|^\s*<feedback", xmlContent)) {
-                    logLine("  RUA: attachment #att.name# decoded but doesn't look like XML (first 100: #left(xmlContent,100)#)", "WARN");
+                    logLine("  RUA: bytes don't look like XML (first 80: #left(xmlContent,80)#)", "WARN");
                     xmlContent = "";
                 }
             } catch(any attErr) {
-                logLine("  RUA: error extracting attachment #att.name#: #attErr.message#", "WARN");
+                logLine("  RUA: extractXmlFromBytes error: #attErr.message#", "WARN");
                 xmlContent = "";
             }
             if (len(trim(xmlContent))) break;
@@ -111,7 +93,7 @@
                 xmlContent = extractXmlFromBytes(rawFileBytes);
                 if (NOT reFindNoCase("^\s*<\?xml|^\s*<feedback", xmlContent)) xmlContent = "";
             } catch(any attErr) {
-                logLine("  RUA: error reading attachment file #att.name#: #attErr.message#", "WARN");
+                logLine("  RUA: error reading file attachment: #attErr.message#", "WARN");
             }
             try { fileDelete(att.file); } catch(any e) {}
             if (len(trim(xmlContent))) break;
@@ -135,7 +117,6 @@
 
     fb = rpt.feedback;
 
-    // Header metadata
     orgName    = getNodeText(fb, "report_metadata.org_name");
     reportId   = getNodeText(fb, "report_metadata.report_id");
     email      = getNodeText(fb, "report_metadata.email");
@@ -156,9 +137,11 @@
 
     // -------------------------------------------------------------------
     // Insert report header
+    // INSERT IGNORE silently skips duplicate (domain, reportid) combos —
+    // which happen when multiple emails carry the same DMARC report.
     // -------------------------------------------------------------------
     queryExecute(
-        "INSERT INTO report
+        "INSERT IGNORE INTO report
              (mindate, maxdate, domain, org, reportid, email,
               extra_contact_info, policy_adkim, policy_aspf,
               policy_p, policy_sp, policy_pct,
@@ -187,7 +170,12 @@
         { datasource: application.db.dsn, result: "insertResult" }
     );
 
+    // INSERT IGNORE returns generatedKey=0 when the row was skipped
     newReportId = insertResult.generatedKey;
+    if (NOT val(newReportId)) {
+        logLine("  RUA: duplicate report skipped (domain=#pDomain# reportId=#left(reportId,40)#)");
+        return;
+    }
     logLine("  RUA: inserted report id=#newReportId# org=#orgName# domain=#pDomain#");
 
     // -------------------------------------------------------------------
@@ -222,30 +210,12 @@
         optVals   = "";
         optParams = [];
 
-        if (len(reasonType)) {
-            optCols &= ", reason"; optVals &= ", ?";
-            arrayAppend(optParams, { value: left(reasonType,100),    cfsqltype: "cf_sql_varchar" });
-        }
-        if (len(reasonComment)) {
-            optCols &= ", comment"; optVals &= ", ?";
-            arrayAppend(optParams, { value: left(reasonComment,255), cfsqltype: "cf_sql_varchar" });
-        }
-        if (len(dkimDomain)) {
-            optCols &= ", dkimdomain"; optVals &= ", ?";
-            arrayAppend(optParams, { value: left(dkimDomain,253),    cfsqltype: "cf_sql_varchar" });
-        }
-        if (len(dkimResult)) {
-            optCols &= ", dkimresult"; optVals &= ", ?";
-            arrayAppend(optParams, { value: left(dkimResult,20),     cfsqltype: "cf_sql_varchar" });
-        }
-        if (len(spfDomain)) {
-            optCols &= ", spfdomain"; optVals &= ", ?";
-            arrayAppend(optParams, { value: left(spfDomain,253),     cfsqltype: "cf_sql_varchar" });
-        }
-        if (len(spfResult)) {
-            optCols &= ", spfresult"; optVals &= ", ?";
-            arrayAppend(optParams, { value: left(spfResult,20),      cfsqltype: "cf_sql_varchar" });
-        }
+        if (len(reasonType))    { optCols &= ", reason";     optVals &= ", ?"; arrayAppend(optParams, { value: left(reasonType,100),    cfsqltype: "cf_sql_varchar" }); }
+        if (len(reasonComment)) { optCols &= ", comment";    optVals &= ", ?"; arrayAppend(optParams, { value: left(reasonComment,255), cfsqltype: "cf_sql_varchar" }); }
+        if (len(dkimDomain))    { optCols &= ", dkimdomain"; optVals &= ", ?"; arrayAppend(optParams, { value: left(dkimDomain,253),    cfsqltype: "cf_sql_varchar" }); }
+        if (len(dkimResult))    { optCols &= ", dkimresult"; optVals &= ", ?"; arrayAppend(optParams, { value: left(dkimResult,20),     cfsqltype: "cf_sql_varchar" }); }
+        if (len(spfDomain))     { optCols &= ", spfdomain";  optVals &= ", ?"; arrayAppend(optParams, { value: left(spfDomain,253),     cfsqltype: "cf_sql_varchar" }); }
+        if (len(spfResult))     { optCols &= ", spfresult";  optVals &= ", ?"; arrayAppend(optParams, { value: left(spfResult,20),      cfsqltype: "cf_sql_varchar" }); }
 
         baseParams = [
             { value: newReportId,          cfsqltype: "cf_sql_integer" },

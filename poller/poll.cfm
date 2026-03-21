@@ -48,10 +48,8 @@
     // CFML's listToArray treats each CHARACTER of the delimiter as a separate
     // split token. For multi-character delimiters like MIME boundaries we must
     // use Java's String.split() with a regex-escaped delimiter instead.
-    // Returns a CFML array of substrings (empty segments are preserved).
     // -----------------------------------------------------------------------
     function splitOnLiteral(required string str, required string delim) {
-        // Pattern.quote() escapes all regex special chars in the delimiter
         var pattern = createObject("java","java.util.regex.Pattern").quote(arguments.delim);
         var parts   = createObject("java","java.lang.String").init(arguments.str).split(pattern, -1);
         var result  = [];
@@ -61,22 +59,9 @@
 
     // -----------------------------------------------------------------------
     // extractDmarcAttachment(mimeBody, topHeaders)
-    //
-    // Given the raw MIME body string from doveadm fetch "body" and the
-    // top-level headers string from doveadm fetch "hdr", find the DMARC
-    // attachment, base64-decode it, and return the raw bytes.
-    //
-    // Handles:
-    //   - Single-part messages where the body IS the base64 attachment
-    //     (Google DMARC reports: Content-Type: application/zip at top level)
-    //   - Multipart messages where the attachment is a named MIME part
-    //   - One level of nested multipart
-    //
-    // Returns: byte array, or javaCast("null","") if nothing usable found.
     // -----------------------------------------------------------------------
     function extractDmarcAttachment(required string mimeBody, required string topHeaders) {
 
-        // ---- helper: parse header block into a struct (lowercased names) ----
         function parseHeaders(required string hdrs) {
             var result   = {};
             var unfolded = reReplace(arguments.hdrs, "(#chr(13)##chr(10)#|#chr(10)#)[ #chr(9)#]+", " ", "ALL");
@@ -90,7 +75,6 @@
             return result;
         }
 
-        // ---- helper: extract boundary value from Content-Type header ----
         function getBoundary(required string ctValue) {
             var m = reFind("(?i)boundary=[""']?([^""';\s,]+)[""']?", arguments.ctValue, 1, true);
             if (m.len[1] GT 0 AND arrayLen(m.len) GT 1)
@@ -98,7 +82,6 @@
             return "";
         }
 
-        // ---- helper: is this Content-Type / filename a DMARC attachment? ----
         function isDmarcPart(required string ct, required string fn) {
             if (reFindNoCase("application/(zip|gzip|x-zip|x-zip-compressed|x-gzip|octet-stream)", arguments.ct)) return true;
             if (reFindNoCase("\.xml(\.gz|\.zip)?$", arguments.fn)) return true;
@@ -106,7 +89,6 @@
             return false;
         }
 
-        // ---- helper: extract filename from Content-Disposition / Content-Type ----
         function getFilename(required string cd, required string ct) {
             var combined = arguments.cd & " " & arguments.ct;
             var m = reFind("(?i)filename=[""']?([^""';\r\n]+)[""']?", combined, 1, true);
@@ -115,14 +97,12 @@
             return "";
         }
 
-        // ---- helper: base64-decode payload string to byte array ----
         function b64decode(required string payload) {
             var clean = reReplace(arguments.payload, "\s+", "", "ALL");
             if (NOT len(clean)) return javaCast("null","");
             return createObject("java","java.util.Base64").getDecoder().decode(clean);
         }
 
-        // ---- helper: find first blank-line split in a MIME part ----
         function findBodyStart(required string part) {
             var crlfPos = find(chr(13) & chr(10) & chr(13) & chr(10), arguments.part);
             if (crlfPos GT 0) return crlfPos + 4;
@@ -131,15 +111,10 @@
             return 0;
         }
 
-        // ---- helper: process array of MIME parts; return first DMARC attachment bytes ----
-        // Uses splitOnLiteral() to split on the boundary string — NOT listToArray,
-        // which mishandles multi-character delimiters in CFML.
         function processParts(required array parts) {
             for (var rawPart in arguments.parts) {
                 rawPart = trim(rawPart);
-                if (NOT len(rawPart)) continue;
-                // Skip the MIME epilogue marker "--"
-                if (rawPart EQ "--") continue;
+                if (NOT len(rawPart) OR rawPart EQ "--") continue;
 
                 var bStart = findBodyStart(rawPart);
                 if (bStart EQ 0) continue;
@@ -171,9 +146,6 @@
             return javaCast("null","");
         }
 
-        // ================================================================
-        // Main logic
-        // ================================================================
         var topHdrs  = parseHeaders(arguments.topHeaders);
         var topCT    = structKeyExists(topHdrs, "content-type")              ? topHdrs["content-type"]              : "";
         var topCTE   = structKeyExists(topHdrs, "content-transfer-encoding") ? topHdrs["content-transfer-encoding"] : "7bit";
@@ -183,7 +155,6 @@
 
         logLine("  MIME: topCT=[#left(topCT,80)#] CTE=[#topCTE#] boundary=[#boundary#] bodyLen=#len(arguments.mimeBody)#");
 
-        // Path 1: entire body is the attachment (Google single-part, no boundary)
         if (isDmarcPart(topCT, topFN) AND NOT len(boundary)) {
             logLine("  MIME path 1: single-part, CTE=#topCTE#");
             if (lCase(trim(topCTE)) EQ "base64") {
@@ -199,14 +170,12 @@
             }
         }
 
-        // Path 2: multipart — split on literal boundary string, find attachment part
         if (len(boundary)) {
             logLine("  MIME path 2: multipart, boundary=#left(boundary,40)#");
             var result = processParts(splitOnLiteral(arguments.mimeBody, "--" & boundary));
             if (NOT isNull(result)) return result;
         }
 
-        // Path 3: fallback — try whole body as flat base64
         logLine("  MIME path 3: flat-base64 fallback, bodyLen=#len(arguments.mimeBody)#", "WARN");
         try {
             var dec = b64decode(arguments.mimeBody);
@@ -217,50 +186,39 @@
     }
 
     // -----------------------------------------------------------------------
-    // fetchViaDoveadm — retrieve raw hdr + body for one UID via doveadm.
+    // fetchViaDoveadm — retrieve raw hdr + body for one UID.
     //
-    // doveadm "hdr body" output uses either LF or CRLF line endings depending
-    // on the message. The section labels are literal lines:
-    //   "hdr:" followed by a newline
-    //   "body:" followed by a newline
-    //
-    // We find these with a simple string search rather than a regex, which
-    // is unreliable with mixed line endings in Lucee's POSIX regex engine.
-    //
-    // cfexecute throws (rather than populating errorvariable) when doveadm
-    // exits non-zero — e.g. when a UID was deleted between cfimap listing
-    // and the doveadm call. We catch that and return an empty result so the
-    // caller can skip the message cleanly without a hard error.
+    // When doveadm exits non-zero (e.g. UID no longer exists), cfexecute
+    // throws a Java-level exception that CFML try/catch may not intercept
+    // reliably in all Lucee versions. To avoid the FETCHERR scope issue
+    // entirely, we use terminateOnTimeout=false and omit errorvariable,
+    // then treat empty fetchOut as a soft failure.
     // -----------------------------------------------------------------------
     function fetchViaDoveadm(required string username, required string mailbox, required string uid) {
         var result   = { body:"", headers:"", contentType:"", messageId:"" };
         var fetchOut = "";
-        var fetchErr = "";
 
+        // Use tag-based cfexecute via cfscript syntax but without errorvariable
+        // to avoid the scope conflict that causes "variable [FETCHERR] doesn't exist".
+        // terminateOnTimeout=false prevents throws on non-zero exit codes in Lucee.
         try {
             cfexecute(
-                name          = "/usr/bin/doveadm",
-                arguments     = 'fetch -u #arguments.username# "hdr body" mailbox #arguments.mailbox# uid #arguments.uid#',
-                variable      = "fetchOut",
-                errorvariable = "fetchErr",
-                timeout       = 30
+                name              = "/usr/bin/doveadm",
+                arguments         = 'fetch -u #arguments.username# "hdr body" mailbox #arguments.mailbox# uid #arguments.uid#',
+                variable          = "fetchOut",
+                timeout           = 30,
+                terminateOnTimeout = false
             );
         } catch(any execErr) {
-            // doveadm exited non-zero (message deleted, permission error, etc.)
-            logLine("  doveadm failed uid=#arguments.uid#: #execErr.message#", "WARN");
+            logLine("  doveadm exec error uid=#arguments.uid#: #execErr.message#", "WARN");
             return result;
         }
 
-        if (len(trim(fetchErr))) {
-            logLine("  doveadm stderr uid=#arguments.uid#: #left(fetchErr,300)#", "WARN");
-        }
         if (NOT len(trim(fetchOut))) {
-            logLine("  doveadm empty output uid=#arguments.uid# (message deleted?)", "WARN");
+            logLine("  doveadm empty output uid=#arguments.uid# (deleted or inaccessible)", "WARN");
             return result;
         }
 
-        // Locate section labels using literal string search.
-        // Try CRLF first, then LF.
         var hdrLabel  = "";
         var bodyLabel = "";
         var hdrPos    = 0;
@@ -289,12 +247,10 @@
         if (bodyPos GT 0) {
             var bodyContentStart = bodyPos + len(bodyLabel);
             result.body = mid(fetchOut, bodyContentStart, len(fetchOut));
-            // Not trim()-ing body: extractDmarcAttachment handles internal whitespace
         }
 
         logLine("  fetch: hdrLen=#len(result.headers)# bodyLen=#len(result.body)#");
 
-        // Unfold RFC 2822 headers before extracting Content-Type / Message-ID
         var unfolded = reReplace(result.headers, "(#chr(13)##chr(10)#|#chr(10)#)[ #chr(9)#]+", " ", "ALL");
 
         var ctMatch = reFind("(?i)Content-Type:\s*([^\r\n]+)", unfolded, 1, true);
@@ -311,7 +267,7 @@
     // -----------------------------------------------------------------------
     // Main poll loop
     // -----------------------------------------------------------------------
-    logLine("=== Poll run started (v5) ===");
+    logLine("=== Poll run started (v6) ===");
 
     qAccounts = queryExecute(
         "SELECT id, label, host, port, username,
@@ -366,7 +322,6 @@
                     msgUID     = qHeaders.uid[msgIdx];
                     msgSubject = qHeaders.subject[msgIdx];
 
-                    // Quick dedup from header column (avoids doveadm call for already-seen messages)
                     rawHdr     = qHeaders.header[msgIdx];
                     midMatch   = reFind("(?i)Message-ID:\s*([^\r\n]+)", rawHdr, 1, true);
                     quickMsgId = "";
@@ -394,7 +349,6 @@
                     attachments  = [];
                     msgMessageId = len(fetched.messageId) ? fetched.messageId : (len(quickMsgId) ? quickMsgId : createUUID());
 
-                    // Initialize rawBytes each iteration — no "var" at page scope
                     rawBytes = javaCast("null","");
 
                     if (len(trim(fetched.body))) {
@@ -410,13 +364,14 @@
                             logLine("  uid=#msgUID# extract error: #decErr.message# | #decErr.detail#", "WARN");
                         }
                     } else {
-                        logLine("  uid=#msgUID# body empty after fetch", "WARN");
+                        logLine("  uid=#msgUID# body empty — doveadm returned nothing (UID gone?)", "WARN");
+                        totalSkip++;
+                        continue;
                     }
 
                     cleanMsgId = reReplace(trim(msgMessageId), "[<>\s]", "", "ALL");
                     if (NOT len(cleanMsgId)) cleanMsgId = createUUID();
 
-                    // Final dedup (in case quickMsgId was empty above)
                     qDupe = queryExecute("SELECT id FROM report WHERE message_id=? LIMIT 1",
                         [{value:cleanMsgId, cfsqltype:"cf_sql_varchar"}],
                         {datasource:application.db.dsn});
