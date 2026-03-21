@@ -4,7 +4,7 @@
       Access control: caller must supply ?token= matching application.poller.token.
 
       Mailbox disposition after processing is controlled by two settings:
-        application.poller.markAsRead  (boolean) - set \Seen flag
+        application.poller.markAsRead  (boolean) - set \Seen flag via doveadm
         application.poller.deleteAfter (boolean) - expunge after processing
       deleteAfter only fires after a confirmed DB write (new) or confirmed
       duplicate skip; it never fires on error.
@@ -13,6 +13,7 @@
         Password accounts (local Dovecot):
           - cfimap getHeaderOnly  : list messages, get UIDs and Message-IDs for dedup
           - doveadm fetch         : retrieve hdr + body per UID (fields: "hdr body")
+          - doveadm flags add     : mark \Seen (cfimap markRead silently fails on Dovecot)
           - extractDmarcAttachment: parse raw MIME body, locate ZIP/GZ/XML part,
                                     base64-decode only the attachment payload
           - extractXmlFromBytes   : decompress ZIP/GZ in parse_rua.cfm
@@ -54,18 +55,30 @@
     }
 
     // -----------------------------------------------------------------------
-    // disposeMessage(connection, mailbox, uid)
+    // disposeMessage(username, mailbox, uid)
     //
     // Called after a message has been successfully handled (inserted or confirmed
     // duplicate). Applies markAsRead and/or deleteAfter per settings.
     // Never called on error paths so we never discard a message we failed to store.
+    //
+    // markRead uses doveadm flags add \Seen rather than cfimap action="markRead".
+    // Lucee's cfimap markRead silently does nothing against a real Dovecot server;
+    // doveadm is the same reliable path we already use for fetching message bodies.
     // -----------------------------------------------------------------------
-    function disposeMessage(required string connection, required string mailbox, required string uid) {
+    function disposeMessage(required string username, required string mailbox, required string uid) {
         if (application.poller.markAsRead) {
             try {
-                cfimap(action="markRead", connection=arguments.connection,
-                       folder=arguments.mailbox, uid=arguments.uid);
-            } catch(any e) {}
+                var flagOut = "";
+                cfexecute(
+                    name               = "/usr/bin/doveadm",
+                    arguments          = "flags add -u #arguments.username# \Seen mailbox #arguments.mailbox# uid #arguments.uid#",
+                    variable           = "flagOut",
+                    timeout            = 15,
+                    terminateOnTimeout = false
+                );
+            } catch(any e) {
+                logLine("  disposeMessage: doveadm flags add error uid=#arguments.uid#: #e.message#", "WARN");
+            }
         }
         if (structKeyExists(application.poller, "deleteAfter") AND application.poller.deleteAfter) {
             try {
@@ -380,7 +393,7 @@
                         if (qDupe.recordCount) {
                             logLine("  uid=#msgUID# already in DB - skipping");
                             totalSkip++;
-                            disposeMessage("poll_#acct.id#", mailbox, msgUID);
+                            disposeMessage(acct.username, mailbox, msgUID);
                             continue;
                         }
                     }
@@ -420,7 +433,7 @@
                     if (qDupe.recordCount) {
                         logLine("  uid=#msgUID# duplicate - skipping");
                         totalSkip++;
-                        disposeMessage("poll_#acct.id#", mailbox, msgUID);
+                        disposeMessage(acct.username, mailbox, msgUID);
                         continue;
                     }
 
@@ -437,7 +450,7 @@
                     }
 
                     // Only dispose after confirmed DB write (parse_rua/ruf succeeded)
-                    disposeMessage("poll_#acct.id#", mailbox, msgUID);
+                    disposeMessage(acct.username, mailbox, msgUID);
                     totalNew++;
 
                 } catch(any msgErr) {
