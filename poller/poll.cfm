@@ -59,6 +59,15 @@
 
     // -----------------------------------------------------------------------
     // extractDmarcAttachment(mimeBody, topHeaders)
+    //
+    // Given raw doveadm output sections, locate and base64-decode the DMARC
+    // attachment bytes. Handles:
+    //   Path 1: Top-level Content-Type is the attachment (Google single-part)
+    //   Path 2: multipart/* — split on boundary, find attachment MIME part
+    //   Path 3: fallback — try treating entire body as flat base64
+    //
+    // Uses splitOnLiteral() for boundary splitting; listToArray() mishandles
+    // multi-character delimiters by treating each char as a separate token.
     // -----------------------------------------------------------------------
     function extractDmarcAttachment(required string mimeBody, required string topHeaders) {
 
@@ -153,15 +162,13 @@
         var topFN    = getFilename(topCD, topCT);
         var boundary = getBoundary(topCT);
 
-        logLine("  MIME: topCT=[#left(topCT,80)#] CTE=[#topCTE#] boundary=[#boundary#] bodyLen=#len(arguments.mimeBody)#");
-
+        // Path 1: top-level Content-Type IS the attachment (e.g. Google single-part ZIP)
         if (isDmarcPart(topCT, topFN) AND NOT len(boundary)) {
-            logLine("  MIME path 1: single-part, CTE=#topCTE#");
             if (lCase(trim(topCTE)) EQ "base64") {
                 try {
                     var dec = b64decode(arguments.mimeBody);
                     if (NOT isNull(dec) AND arrayLen(dec) GT 4) return dec;
-                } catch(any e) { logLine("  MIME path 1 error: #e.message#", "WARN"); }
+                } catch(any e) { logLine("  MIME path 1 decode error: #e.message#", "WARN"); }
             } else {
                 try {
                     var rawB = arguments.mimeBody.getBytes("ISO-8859-1");
@@ -170,13 +177,15 @@
             }
         }
 
+        // Path 2: multipart — split on boundary, find attachment part
         if (len(boundary)) {
-            logLine("  MIME path 2: multipart, boundary=#left(boundary,40)#");
             var result = processParts(splitOnLiteral(arguments.mimeBody, "--" & boundary));
             if (NOT isNull(result)) return result;
         }
 
-        logLine("  MIME path 3: flat-base64 fallback, bodyLen=#len(arguments.mimeBody)#", "WARN");
+        // Path 3: fallback — try entire body as flat base64
+        // Reaching here means no standard attachment path worked; log for diagnostics
+        logLine("  MIME: unexpected structure CT=[#left(topCT,60)#] boundary=[#boundary#] bodyLen=#len(arguments.mimeBody)#", "WARN");
         try {
             var dec = b64decode(arguments.mimeBody);
             if (NOT isNull(dec) AND arrayLen(dec) GT 4) return dec;
@@ -186,27 +195,23 @@
     }
 
     // -----------------------------------------------------------------------
-    // fetchViaDoveadm — retrieve raw hdr + body for one UID.
+    // fetchViaDoveadm — retrieve raw hdr + body for one UID via doveadm.
     //
-    // When doveadm exits non-zero (e.g. UID no longer exists), cfexecute
-    // throws a Java-level exception that CFML try/catch may not intercept
-    // reliably in all Lucee versions. To avoid the FETCHERR scope issue
-    // entirely, we use terminateOnTimeout=false and omit errorvariable,
-    // then treat empty fetchOut as a soft failure.
+    // doveadm exits non-zero when a UID no longer exists (deleted between
+    // cfimap listing and the doveadm call). We omit errorvariable to avoid
+    // Lucee scope issues, use terminateOnTimeout=false to suppress throws,
+    // and treat empty output as a soft skip.
     // -----------------------------------------------------------------------
     function fetchViaDoveadm(required string username, required string mailbox, required string uid) {
         var result   = { body:"", headers:"", contentType:"", messageId:"" };
         var fetchOut = "";
 
-        // Use tag-based cfexecute via cfscript syntax but without errorvariable
-        // to avoid the scope conflict that causes "variable [FETCHERR] doesn't exist".
-        // terminateOnTimeout=false prevents throws on non-zero exit codes in Lucee.
         try {
             cfexecute(
-                name              = "/usr/bin/doveadm",
-                arguments         = 'fetch -u #arguments.username# "hdr body" mailbox #arguments.mailbox# uid #arguments.uid#',
-                variable          = "fetchOut",
-                timeout           = 30,
+                name               = "/usr/bin/doveadm",
+                arguments          = 'fetch -u #arguments.username# "hdr body" mailbox #arguments.mailbox# uid #arguments.uid#',
+                variable           = "fetchOut",
+                timeout            = 30,
                 terminateOnTimeout = false
             );
         } catch(any execErr) {
@@ -219,38 +224,30 @@
             return result;
         }
 
-        var hdrLabel  = "";
-        var bodyLabel = "";
-        var hdrPos    = 0;
-        var bodyPos   = 0;
+        // Locate "hdr:" and "body:" section labels using literal string search.
+        // Regex is unreliable with mixed CRLF/LF line endings in Lucee's POSIX engine.
+        var hdrLabel  = (find("hdr:" & chr(13) & chr(10), fetchOut) GT 0)
+                        ? "hdr:"  & chr(13) & chr(10)
+                        : "hdr:"  & chr(10);
+        var bodyLabel = (find("body:" & chr(13) & chr(10), fetchOut) GT 0)
+                        ? "body:" & chr(13) & chr(10)
+                        : "body:" & chr(10);
 
-        if (find("hdr:" & chr(13) & chr(10), fetchOut) GT 0) {
-            hdrLabel  = "hdr:"  & chr(13) & chr(10);
-            bodyLabel = "body:" & chr(13) & chr(10);
-        } else {
-            hdrLabel  = "hdr:"  & chr(10);
-            bodyLabel = "body:" & chr(10);
-        }
-
-        hdrPos  = find(hdrLabel,  fetchOut);
-        bodyPos = find(bodyLabel, fetchOut, hdrPos + len(hdrLabel));
+        var hdrPos  = find(hdrLabel,  fetchOut);
+        var bodyPos = find(bodyLabel, fetchOut, hdrPos + len(hdrLabel));
 
         if (hdrPos GT 0) {
             var hdrContentStart = hdrPos + len(hdrLabel);
-            if (bodyPos GT 0) {
-                result.headers = trim(mid(fetchOut, hdrContentStart, bodyPos - hdrContentStart));
-            } else {
-                result.headers = trim(mid(fetchOut, hdrContentStart, len(fetchOut)));
-            }
+            result.headers = (bodyPos GT 0)
+                ? trim(mid(fetchOut, hdrContentStart, bodyPos - hdrContentStart))
+                : trim(mid(fetchOut, hdrContentStart, len(fetchOut)));
         }
 
         if (bodyPos GT 0) {
-            var bodyContentStart = bodyPos + len(bodyLabel);
-            result.body = mid(fetchOut, bodyContentStart, len(fetchOut));
+            result.body = mid(fetchOut, bodyPos + len(bodyLabel), len(fetchOut));
         }
 
-        logLine("  fetch: hdrLen=#len(result.headers)# bodyLen=#len(result.body)#");
-
+        // Unfold RFC 2822 headers, then extract Content-Type and Message-ID
         var unfolded = reReplace(result.headers, "(#chr(13)##chr(10)#|#chr(10)#)[ #chr(9)#]+", " ", "ALL");
 
         var ctMatch = reFind("(?i)Content-Type:\s*([^\r\n]+)", unfolded, 1, true);
@@ -267,7 +264,7 @@
     // -----------------------------------------------------------------------
     // Main poll loop
     // -----------------------------------------------------------------------
-    logLine("=== Poll run started (v6) ===");
+    logLine("=== Poll run started ===");
 
     qAccounts = queryExecute(
         "SELECT id, label, host, port, username,
@@ -322,6 +319,7 @@
                     msgUID     = qHeaders.uid[msgIdx];
                     msgSubject = qHeaders.subject[msgIdx];
 
+                    // Quick dedup via Message-ID from cfimap header (avoids doveadm round-trip)
                     rawHdr     = qHeaders.header[msgIdx];
                     midMatch   = reFind("(?i)Message-ID:\s*([^\r\n]+)", rawHdr, 1, true);
                     quickMsgId = "";
@@ -341,8 +339,6 @@
                         }
                     }
 
-                    logLine("  uid=#msgUID# fetching via doveadm...");
-
                     fetched      = fetchViaDoveadm(acct.username, mailbox, msgUID);
                     contentType  = fetched.contentType;
                     msgBody      = "";
@@ -356,15 +352,14 @@
                             rawBytes = extractDmarcAttachment(fetched.body, fetched.headers);
                             if (NOT isNull(rawBytes) AND arrayLen(rawBytes) GT 4) {
                                 attachments = [{ name: "report", bytes: rawBytes }];
-                                logLine("  uid=#msgUID# decoded #arrayLen(rawBytes)# bytes");
                             } else {
                                 logLine("  uid=#msgUID# no attachment bytes extracted", "WARN");
                             }
                         } catch(any decErr) {
-                            logLine("  uid=#msgUID# extract error: #decErr.message# | #decErr.detail#", "WARN");
+                            logLine("  uid=#msgUID# extract error: #decErr.message#", "WARN");
                         }
                     } else {
-                        logLine("  uid=#msgUID# body empty — doveadm returned nothing (UID gone?)", "WARN");
+                        // doveadm returned nothing — UID was deleted after cfimap listed it
                         totalSkip++;
                         continue;
                     }
@@ -372,6 +367,7 @@
                     cleanMsgId = reReplace(trim(msgMessageId), "[<>\s]", "", "ALL");
                     if (NOT len(cleanMsgId)) cleanMsgId = createUUID();
 
+                    // Final dedup on full Message-ID (catches cases where quickMsgId was empty)
                     qDupe = queryExecute("SELECT id FROM report WHERE message_id=? LIMIT 1",
                         [{value:cleanMsgId, cfsqltype:"cf_sql_varchar"}],
                         {datasource:application.db.dsn});
@@ -388,10 +384,10 @@
                     if (NOT isRUF AND len(fetched.headers)) isRUF = reFindNoCase("feedback-report", fetched.headers);
 
                     if (isRUF) {
-                        logLine("  -> RUF");
+                        logLine("  uid=#msgUID# -> RUF");
                         include "/poller/parse_ruf.cfm";
                     } else {
-                        logLine("  -> RUA (subject: #left(msgSubject,80)#)");
+                        logLine("  uid=#msgUID# -> RUA");
                         include "/poller/parse_rua.cfm";
                     }
 
