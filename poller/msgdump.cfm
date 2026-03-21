@@ -1,5 +1,5 @@
 <!--- poller/msgdump.cfm
-      Diagnostic: dump what cfimap getAll returns for a given message UID.
+      Diagnostic: dump what cfimap getAll returns for a given UID.
       Usage: /poller/msgdump.cfm?token=TOKEN&uid=1
       DELETE THIS FILE after debugging.
 --->
@@ -32,34 +32,32 @@ cfimap(action="getAll", connection="dump_conn", folder=q.mailbox,
 
 cfimap(action="close", connection="dump_conn");
 
-writeOutput("<h3>getAll result columns:</h3><pre>");
-writeOutput(htmlEditFormat(structKeyList(qMsg.getMetadata())));
-writeOutput("</pre>");
+writeOutput("columns: " & queryColumnList(qMsg) & "<br><br>");
+writeOutput("subject: "   & htmlEditFormat(qMsg.subject)   & "<br>");
+writeOutput("messageId: " & htmlEditFormat(qMsg.messageId) & "<br>");
+writeOutput("body len: "  & len(qMsg.body)                & "<br>");
 
-writeOutput("<b>subject:</b> " & htmlEditFormat(qMsg.subject) & "<br>");
-writeOutput("<b>messageId:</b> " & htmlEditFormat(qMsg.messageId) & "<br>");
-writeOutput("<b>body length:</b> " & len(qMsg.body) & "<br>");
-writeOutput("<b>body (first 200 bytes as hex):</b><br>");
 if (len(qMsg.body)) {
     bodyBytes = qMsg.body.getBytes("ISO-8859-1");
     hexStr = "";
-    for (i=1; i LTE min(arrayLen(bodyBytes),200); i++) {
+    top = min(arrayLen(bodyBytes), 32);
+    for (i = 1; i LTE top; i++) {
         b = bodyBytes[i];
         if (b LT 0) b = b + 256;
-        hexStr &= right("0" & formatBaseN(b,16), 2) & " ";
+        hexStr &= right("0" & formatBaseN(b, 16), 2) & " ";
     }
-    writeOutput("<pre>" & hexStr & "</pre>");
+    writeOutput("body first #top# bytes (hex): " & hexStr & "<br>");
 }
 
-writeOutput("<b>attachments column:</b> [" & htmlEditFormat(qMsg.attachments) & "]<br>");
+writeOutput("attachments col: [" & htmlEditFormat(qMsg.attachments) & "]<br><br>");
 
 qFiles = directoryList(attachDir, false, "query");
-writeOutput("<b>files saved to attachDir (" & attachDir & "):</b> " & qFiles.recordCount & "<br>");
+writeOutput("files in attachDir: " & qFiles.recordCount & "<br>");
 for (f in qFiles) {
     writeOutput("  " & f.name & " (" & f.size & " bytes)<br>");
 }
 
-writeOutput("<hr><b>header (first 800 chars):</b><pre>");
-writeOutput(htmlEditFormat(left(qMsg.header, 800)));
+writeOutput("<br><b>header (first 1000 chars):</b><br><pre>");
+writeOutput(htmlEditFormat(left(qMsg.header, 1000)));
 writeOutput("</pre>");
 </cfscript>
