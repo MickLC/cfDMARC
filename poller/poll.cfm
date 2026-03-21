@@ -371,6 +371,18 @@
             msgCount = qHeaders.recordCount;
             logLine("#msgCount# message(s) in mailbox (pre-seen-filter)");
 
+            // DIAGNOSTIC: log column names and uid=1 flags value so we can see
+            // exactly what cfimap getHeaderOnly returns. Remove after diagnosis.
+            logLine("DIAG qHeaders columns: #arrayToList(qHeaders.getColumnNames())#", "INFO");
+            if (msgCount GT 0) {
+                diagFlags = structKeyExists(qHeaders, "flags") ? qHeaders.flags[1] : "(flags column absent)";
+                diagFlagsHex = "";
+                for (diagI = 1; diagI LTE len(diagFlags); diagI++) {
+                    diagFlagsHex &= right("0" & formatBaseN(asc(mid(diagFlags, diagI, 1)), 16), 2) & " ";
+                }
+                logLine("DIAG uid=#qHeaders.uid[1]# flags=[#diagFlags#] hex=[#trim(diagFlagsHex)#] SEEN_FLAG hex=[5c 53 65 65 6e]", "INFO");
+            }
+
             for (msgIdx = 1; msgIdx LTE msgCount; msgIdx++) {
 
                 try {
