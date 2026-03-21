@@ -47,6 +47,12 @@
     totalSkip  = 0;
     totalError = 0;
 
+    // IMAP \Seen flag as a literal string - chr(92) is backslash.
+    // Do NOT write "\Seen" in a CFML string literal: Lucee treats \S as an
+    // escape sequence and the backslash is dropped, breaking both the flag
+    // check (findNoCase) and the doveadm flags add argument.
+    SEEN_FLAG = chr(92) & "Seen";
+
     function logLine(required string msg, string level="INFO") {
         var ts = dateTimeFormat(now(), "yyyy-mm-dd HH:nn:ss");
         arrayAppend(pollLog, "[#ts#] [#arguments.level#] #arguments.msg#");
@@ -71,7 +77,7 @@
                 var flagOut = "";
                 cfexecute(
                     name               = "/usr/bin/doveadm",
-                    arguments          = "flags add -u #arguments.username# \Seen mailbox #arguments.mailbox# uid #arguments.uid#",
+                    arguments          = "flags add -u #arguments.username# #SEEN_FLAG# mailbox #arguments.mailbox# uid #arguments.uid#",
                     variable           = "flagOut",
                     timeout            = 15,
                     terminateOnTimeout = false
@@ -371,10 +377,11 @@
                     msgUID     = qHeaders.uid[msgIdx];
                     msgSubject = qHeaders.subject[msgIdx];
 
-                    // Skip messages already marked \Seen - Lucee cfimap returns
-                    // flags as a comma/space separated string e.g. "\Seen \Flagged"
+                    // Skip messages already marked \Seen.
+                    // SEEN_FLAG = chr(92) & "Seen" — do not use "\Seen" literal,
+                    // Lucee drops the backslash as an escape sequence.
                     msgFlags = structKeyExists(qHeaders, "flags") ? qHeaders.flags[msgIdx] : "";
-                    if (findNoCase("\Seen", msgFlags)) {
+                    if (findNoCase(SEEN_FLAG, msgFlags)) {
                         totalSkip++;
                         continue;
                     }
