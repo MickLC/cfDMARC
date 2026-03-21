@@ -338,26 +338,33 @@
                 timeout    = 60
             );
 
-            // Bug 1 fix: messageType="unread" limits fetch to unseen messages only.
-            // Without this the doveadm path fetches every message in the mailbox
-            // on every poll run instead of only new unread ones.
+            // Lucee's cfimap does not support messageType="unread" (ColdFusion-only).
+            // Fetch all headers up to batchSize, then skip already-seen messages
+            // in the loop below by checking the flags column for \Seen.
             cfimap(
-                action      = "getHeaderOnly",
-                connection  = "poll_#acct.id#",
-                folder      = mailbox,
-                name        = "qHeaders",
-                maxRows     = application.poller.batchSize,
-                messageType = "unread"
+                action     = "getHeaderOnly",
+                connection = "poll_#acct.id#",
+                folder     = mailbox,
+                name       = "qHeaders",
+                maxRows    = application.poller.batchSize
             );
 
             msgCount = qHeaders.recordCount;
-            logLine("#msgCount# message(s) in mailbox");
+            logLine("#msgCount# message(s) in mailbox (pre-seen-filter)");
 
             for (msgIdx = 1; msgIdx LTE msgCount; msgIdx++) {
 
                 try {
                     msgUID     = qHeaders.uid[msgIdx];
                     msgSubject = qHeaders.subject[msgIdx];
+
+                    // Skip messages already marked \Seen - Lucee cfimap returns
+                    // flags as a comma/space separated string e.g. "\Seen \Flagged"
+                    msgFlags = structKeyExists(qHeaders, "flags") ? qHeaders.flags[msgIdx] : "";
+                    if (findNoCase("\Seen", msgFlags)) {
+                        totalSkip++;
+                        continue;
+                    }
 
                     // Quick dedup via Message-ID from cfimap header (avoids doveadm round-trip)
                     rawHdr     = qHeaders.header[msgIdx];
