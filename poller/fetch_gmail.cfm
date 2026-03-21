@@ -33,6 +33,13 @@
         - Unquoted struct keys with underscores get uppercased/mangled by Lucee;
           token refresh POST uses explicit cfhttpparam calls instead of a struct
         - Struct keys used as cfhttpparam names are quoted strings to be safe
+
+      Gmail payload shapes observed in the wild:
+        A) multipart/* — payload.parts[] array, attachments inside parts
+        B) single-part with inline data — payload.body.data (base64url)
+        C) single-part with large attachment — payload.body.attachmentId,
+           payload.body.data is absent or empty (Google DMARC reports use this)
+      All three shapes are handled in Step 5 of the main loop.
 --->
 <cfscript>
 
@@ -89,9 +96,9 @@
         required string  clientSecret
     ) {
         cfhttp(
-            url    = "https://oauth2.googleapis.com/token",
-            method = "POST",
-            result = "refreshResp",
+            url     = "https://oauth2.googleapis.com/token",
+            method  = "POST",
+            result  = "refreshResp",
             timeout = 30
         ) {
             cfhttpparam(type="formfield", name="grant_type",    value="refresh_token");
@@ -197,15 +204,46 @@
     }
 
     // -----------------------------------------------------------------------
+    // fetchAttachmentBytes(body, gmailMsgId, accessToken)
+    //
+    // Given a Gmail message body struct, returns the raw attachment bytes.
+    // Handles both inline data (body.data) and large attachments
+    // (body.attachmentId where body.data is absent).
+    // Returns null if no bytes can be obtained.
+    // -----------------------------------------------------------------------
+    function fetchAttachmentBytes(
+        required struct body,
+        required string gmailMsgId,
+        required string accessToken
+    ) {
+        var attachSize = val(arguments.body.size ?: 0);
+
+        // Inline base64url data
+        if (structKeyExists(arguments.body, "data") AND len(arguments.body.data)) {
+            return b64urlDecode(arguments.body.data);
+        }
+
+        // Large attachment — no inline data, must fetch by attachmentId
+        if (structKeyExists(arguments.body, "attachmentId") AND len(arguments.body.attachmentId)) {
+            logLine("  Gmail: fetching attachment id=#arguments.body.attachmentId# size=#attachSize# msg=#arguments.gmailMsgId#", "INFO");
+            var attData = gmailApiGet(
+                arguments.accessToken,
+                "messages/#arguments.gmailMsgId#/attachments/#arguments.body.attachmentId#"
+            );
+            if (structKeyExists(attData, "data") AND len(attData.data))
+                return b64urlDecode(attData.data);
+            logLine("  Gmail: attachment fetch returned no data id=#arguments.body.attachmentId#", "WARN");
+            return javaCast("null", "");
+        }
+
+        return javaCast("null", "");
+    }
+
+    // -----------------------------------------------------------------------
     // findAttachmentParts(parts, gmailMsgId, accessToken)
     //
     // Recursively walks a Gmail message payload parts[] tree.
     // Returns array of byte arrays for any ZIP/GZ/XML/octet-stream parts.
-    // Fetches large attachments by attachmentId if body.data is absent.
-    //
-    // Matching is intentionally broad: any part with a filename ending in
-    // .zip/.gz/.xml, or a DMARC-relevant MIME type, qualifies.  Google sends
-    // DMARC reports as application/zip with a .zip filename.
     // -----------------------------------------------------------------------
     function findAttachmentParts(
         required array  parts,
@@ -239,29 +277,11 @@
             }
 
             var bodyBytes = javaCast("null", "");
-
             try {
-                if (structKeyExists(part, "body")) {
-                    var body       = part.body;
-                    var attachSize = val(body.size ?: 0);
-
-                    if (structKeyExists(body, "data") AND len(body.data)) {
-                        bodyBytes = b64urlDecode(body.data);
-
-                    } else if (structKeyExists(body, "attachmentId") AND len(body.attachmentId)) {
-                        logLine("  Gmail: fetching attachment id=#body.attachmentId# size=#attachSize# msg=#arguments.gmailMsgId#", "INFO");
-                        var attData = gmailApiGet(
-                            arguments.accessToken,
-                            "messages/#arguments.gmailMsgId#/attachments/#body.attachmentId#"
-                        );
-                        if (structKeyExists(attData, "data") AND len(attData.data))
-                            bodyBytes = b64urlDecode(attData.data);
-                        else
-                            logLine("  Gmail: attachment fetch returned no data id=#body.attachmentId#", "WARN");
-                    } else {
-                        logLine("  Gmail: DMARC part has no data and no attachmentId mime=#mimeType# file=#filename# msg=#arguments.gmailMsgId#", "WARN");
-                    }
-                }
+                if (structKeyExists(part, "body"))
+                    bodyBytes = fetchAttachmentBytes(part.body, arguments.gmailMsgId, arguments.accessToken);
+                else
+                    logLine("  Gmail: DMARC part has no body struct mime=#mimeType# file=#filename# msg=#arguments.gmailMsgId#", "WARN");
             } catch(any partErr) {
                 logLine("  Gmail: attachment decode error msg=#arguments.gmailMsgId# mime=#mimeType#: #partErr.message#", "WARN");
             }
@@ -417,28 +437,46 @@
                             continue;
                         }
 
-                        // Step 5: collect attachment bytes from payload tree.
-                        // No var declarations here — page scope, not function scope.
+                        // Step 5: collect attachment bytes.
+                        // No var declarations — page scope, not function scope.
+                        //
+                        // Shape A: multipart — walk parts[] tree
+                        // Shape B: single-part with inline body.data
+                        // Shape C: single-part with body.attachmentId (no body.data)
+                        //          This is what Google DMARC reports use.
                         attachments  = [];
                         rawBytesList = [];
+                        topMime      = lCase(gmailPayload.mimeType ?: "");
+                        topFile      = lCase(gmailPayload.filename ?: "");
 
                         if (structKeyExists(gmailPayload, "parts") AND isArray(gmailPayload.parts) AND arrayLen(gmailPayload.parts)) {
+                            // Shape A: multipart
                             rawBytesList = findAttachmentParts(gmailPayload.parts, gmailMsgId, gmailToken);
                             for (rb in rawBytesList) {
                                 arrayAppend(attachments, { name: "report", bytes: rb });
                             }
-                        } else if (structKeyExists(gmailPayload, "body") AND structKeyExists(gmailPayload.body, "data") AND len(gmailPayload.body.data)) {
-                            // Single-part message — check if it's a DMARC attachment itself
-                            topMime = lCase(gmailPayload.mimeType ?: "");
-                            topFile = lCase(gmailPayload.filename ?: "");
-                            if (reFindNoCase("application/(zip|gzip|x-zip|x-gzip|octet-stream|xml)", topMime)
-                                OR reFindNoCase("\.(zip|gz|xml)$", topFile)) {
-                                topBytes = b64urlDecode(gmailPayload.body.data);
+
+                        } else if (structKeyExists(gmailPayload, "body") AND isStruct(gmailPayload.body)) {
+                            // Shape B or C: single-part — check MIME type then fetch bytes
+                            isDmarcTopLevel = false;
+                            if (reFindNoCase("application/(zip|gzip|x-zip|x-gzip|octet-stream|xml)", topMime)) isDmarcTopLevel = true;
+                            if (reFindNoCase("\.(zip|gz|xml)$", topFile)) isDmarcTopLevel = true;
+
+                            if (isDmarcTopLevel) {
+                                topBytes = javaCast("null", "");
+                                try {
+                                    topBytes = fetchAttachmentBytes(gmailPayload.body, gmailMsgId, gmailToken);
+                                } catch(any topErr) {
+                                    logLine("  Gmail: top-level attachment fetch error msg=#gmailMsgId#: #topErr.message#", "WARN");
+                                }
                                 if (NOT isNull(topBytes) AND arrayLen(topBytes) GT 4)
                                     arrayAppend(attachments, { name: "report", bytes: topBytes });
+                            } else {
+                                logLine("  Gmail: msg=#gmailMsgId# single-part but not a DMARC MIME type: #topMime#", "WARN");
                             }
+
                         } else {
-                            logLine("  Gmail: msg=#gmailMsgId# has no parts[] and no body.data — mimeType=#lCase(gmailPayload.mimeType ?: 'unknown')#", "WARN");
+                            logLine("  Gmail: msg=#gmailMsgId# unrecognised payload shape — mimeType=#topMime#", "WARN");
                         }
 
                         if (NOT arrayLen(attachments)) {
@@ -493,7 +531,7 @@
 
         } catch(any acctErr) {
             logLine("  Gmail ACCOUNT ERROR (#acct.label#): #acctErr.message# | #acctErr.detail#", "ERROR");
-            totalError++;
+            totalError++; 
             queryExecute(
                 "UPDATE imap_accounts SET last_status=? WHERE id=?",
                 [
