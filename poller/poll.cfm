@@ -43,6 +43,23 @@
     }
 
     // -----------------------------------------------------------------------
+    // splitOnLiteral(str, delimiter)
+    //
+    // CFML's listToArray treats each CHARACTER of the delimiter as a separate
+    // split token. For multi-character delimiters like MIME boundaries we must
+    // use Java's String.split() with a regex-escaped delimiter instead.
+    // Returns a CFML array of substrings (empty segments are preserved).
+    // -----------------------------------------------------------------------
+    function splitOnLiteral(required string str, required string delim) {
+        // Pattern.quote() escapes all regex special chars in the delimiter
+        var pattern = createObject("java","java.util.regex.Pattern").quote(arguments.delim);
+        var parts   = createObject("java","java.lang.String").init(arguments.str).split(pattern, -1);
+        var result  = [];
+        for (var p in parts) arrayAppend(result, javaCast("string", p));
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
     // extractDmarcAttachment(mimeBody, topHeaders)
     //
     // Given the raw MIME body string from doveadm fetch "body" and the
@@ -106,8 +123,6 @@
         }
 
         // ---- helper: find first blank-line split in a MIME part ----
-        // Returns the position of the first character of the body (after the blank line).
-        // Returns 0 if no blank line found.
         function findBodyStart(required string part) {
             var crlfPos = find(chr(13) & chr(10) & chr(13) & chr(10), arguments.part);
             if (crlfPos GT 0) return crlfPos + 4;
@@ -117,10 +132,14 @@
         }
 
         // ---- helper: process array of MIME parts; return first DMARC attachment bytes ----
+        // Uses splitOnLiteral() to split on the boundary string — NOT listToArray,
+        // which mishandles multi-character delimiters in CFML.
         function processParts(required array parts) {
             for (var rawPart in arguments.parts) {
                 rawPart = trim(rawPart);
                 if (NOT len(rawPart)) continue;
+                // Skip the MIME epilogue marker "--"
+                if (rawPart EQ "--") continue;
 
                 var bStart = findBodyStart(rawPart);
                 if (bStart EQ 0) continue;
@@ -136,7 +155,7 @@
                 if (reFindNoCase("^multipart/", pct)) {
                     var ib = getBoundary(pct);
                     if (len(ib)) {
-                        var ir = processParts(listToArray(partBody, "--" & ib));
+                        var ir = processParts(splitOnLiteral(partBody, "--" & ib));
                         if (NOT isNull(ir)) return ir;
                     }
                     continue;
@@ -180,10 +199,10 @@
             }
         }
 
-        // Path 2: multipart — find attachment part
+        // Path 2: multipart — split on literal boundary string, find attachment part
         if (len(boundary)) {
             logLine("  MIME path 2: multipart, boundary=#left(boundary,40)#");
-            var result = processParts(listToArray(arguments.mimeBody, "--" & boundary));
+            var result = processParts(splitOnLiteral(arguments.mimeBody, "--" & boundary));
             if (NOT isNull(result)) return result;
         }
 
@@ -292,7 +311,7 @@
     // -----------------------------------------------------------------------
     // Main poll loop
     // -----------------------------------------------------------------------
-    logLine("=== Poll run started (v4) ===");
+    logLine("=== Poll run started (v5) ===");
 
     qAccounts = queryExecute(
         "SELECT id, label, host, port, username,
@@ -375,8 +394,7 @@
                     attachments  = [];
                     msgMessageId = len(fetched.messageId) ? fetched.messageId : (len(quickMsgId) ? quickMsgId : createUUID());
 
-                    // rawBytes must NOT use "var" here — var is only valid inside functions.
-                    // Initialize to null each iteration to prevent stale values from prior passes.
+                    // Initialize rawBytes each iteration — no "var" at page scope
                     rawBytes = javaCast("null","");
 
                     if (len(trim(fetched.body))) {

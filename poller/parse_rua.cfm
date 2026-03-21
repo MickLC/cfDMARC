@@ -3,9 +3,7 @@
       Included by poll.cfm inside the message-processing loop.
 
       Expects the following variables set by poll.cfm:
-        attachments   — array of structs { name, bytes }  (JavaMail path)
-                        or                { name, file }  (cfImap path)
-        msgBody       — decoded text body of the message
+        attachments   — array of structs { name, bytes }
         cleanMsgId    — deduplicated Message-ID string
         msgSubject    — message subject for logging
         acct          — current imap_accounts row
@@ -15,19 +13,22 @@
 <cfscript>
 
     function extractXmlFromBytes(required any rawBytes) {
-        // Sniff magic bytes
-        // GZip: 0x1F 0x8B  Zip: 0x50 0x4B
-        firstByte  = rawBytes[1];
-        secondByte = rawBytes[2];
+        // Sniff magic bytes (Java bytes are signed; cast to int to get 0-255 range)
+        // GZip: 0x1F 0x8B   ZIP: 0x50 0x4B
+        var b0 = rawBytes[1];
+        var b1 = rawBytes[2];
+        // Convert signed byte to unsigned int for reliable comparison
+        if (b0 LT 0) b0 = b0 + 256;
+        if (b1 LT 0) b1 = b1 + 256;
 
-        if (firstByte EQ 31 AND secondByte EQ 139) {
+        if (b0 EQ 31 AND b1 EQ 139) {
             // GZIP
-            bis = createObject("java","java.io.ByteArrayInputStream").init(rawBytes);
-            gis = createObject("java","java.util.zip.GZIPInputStream").init(bis);
-            sr  = createObject("java","java.io.InputStreamReader").init(gis, "UTF-8");
-            br  = createObject("java","java.io.BufferedReader").init(sr);
-            sb  = createObject("java","java.lang.StringBuilder").init();
-            line = br.readLine();
+            var bis = createObject("java","java.io.ByteArrayInputStream").init(rawBytes);
+            var gis = createObject("java","java.util.zip.GZIPInputStream").init(bis);
+            var sr  = createObject("java","java.io.InputStreamReader").init(gis, "UTF-8");
+            var br  = createObject("java","java.io.BufferedReader").init(sr);
+            var sb  = createObject("java","java.lang.StringBuilder").init();
+            var line = br.readLine();
             while (NOT isNull(line)) {
                 sb.append(line);
                 sb.append(chr(10));
@@ -36,18 +37,18 @@
             br.close();
             return sb.toString();
 
-        } else if (firstByte EQ 80 AND secondByte EQ 75) {
+        } else if (b0 EQ 80 AND b1 EQ 75) {
             // ZIP — first XML entry wins
-            bis   = createObject("java","java.io.ByteArrayInputStream").init(rawBytes);
-            zis   = createObject("java","java.util.zip.ZipInputStream").init(bis);
-            entry = zis.getNextEntry();
+            var bis   = createObject("java","java.io.ByteArrayInputStream").init(rawBytes);
+            var zis   = createObject("java","java.util.zip.ZipInputStream").init(bis);
+            var entry = zis.getNextEntry();
             while (NOT isNull(entry)) {
-                eName = javaCast("string", entry.getName());
+                var eName = javaCast("string", entry.getName());
                 if (reFindNoCase("\.xml$", eName)) {
-                    sr   = createObject("java","java.io.InputStreamReader").init(zis, "UTF-8");
-                    br   = createObject("java","java.io.BufferedReader").init(sr);
-                    sb   = createObject("java","java.lang.StringBuilder").init();
-                    line = br.readLine();
+                    var sr   = createObject("java","java.io.InputStreamReader").init(zis, "UTF-8");
+                    var br   = createObject("java","java.io.BufferedReader").init(sr);
+                    var sb   = createObject("java","java.lang.StringBuilder").init();
+                    var line = br.readLine();
                     while (NOT isNull(line)) {
                         sb.append(line);
                         sb.append(chr(10));
@@ -69,9 +70,9 @@
 
     function getNodeText(required any xmlNode, required string path, string defaultVal="") {
         try {
-            parts   = listToArray(arguments.path, ".");
-            current = arguments.xmlNode;
-            for (part in parts) {
+            var parts   = listToArray(arguments.path, ".");
+            var current = arguments.xmlNode;
+            for (var part in parts) {
                 if (NOT structKeyExists(current, part)) return arguments.defaultVal;
                 current = current[part];
             }
@@ -84,41 +85,36 @@
 
     // -------------------------------------------------------------------
     // Find and decompress the XML attachment
+    // attachments is set by poll.cfm as [{ name: "report", bytes: rawBytes }]
+    // Process any attachment that has a bytes key — the MIME filtering was
+    // already done upstream in extractDmarcAttachment().
     // -------------------------------------------------------------------
     xmlContent = "";
 
-    // Path 1: file/bytes attachments saved by cfimap getAll or JavaMail
     for (att in attachments) {
-        aName = lCase(att.name);
-        if (reFindNoCase("\.xml(\.gz|\.zip)?$", aName) OR reFindNoCase("\.(gz|zip)$", aName)) {
+        if (structKeyExists(att, "bytes") AND NOT isNull(att.bytes) AND arrayLen(att.bytes) GT 4) {
             try {
-                if (structKeyExists(att, "bytes")) {
-                    xmlContent = extractXmlFromBytes(att.bytes);
-                } else if (structKeyExists(att, "file") AND fileExists(att.file)) {
-                    rawBytes   = fileReadBinary(att.file);
-                    xmlContent = extractXmlFromBytes(rawBytes);
-                    try { fileDelete(att.file); } catch(any e) {}
+                xmlContent = extractXmlFromBytes(att.bytes);
+                // Sanity check: must look like XML
+                if (NOT reFindNoCase("^\s*<\?xml|^\s*<feedback", xmlContent)) {
+                    logLine("  RUA: attachment #att.name# decoded but doesn't look like XML (first 100: #left(xmlContent,100)#)", "WARN");
+                    xmlContent = "";
                 }
             } catch(any attErr) {
-                logLine("  RUA: error reading attachment #att.name#: #attErr.message#", "WARN");
-            }
-            if (len(trim(xmlContent))) break;
-        }
-    }
-
-    // Path 2: cfimap getAll can inline the attachment bytes directly in qMsg.body
-    // when the MIME part has Content-Disposition: inline (common with Google reports).
-    // Convert the CFML string back to bytes using ISO-8859-1 (lossless byte<->char mapping).
-    if (NOT len(trim(xmlContent)) AND len(trim(msgBody))) {
-        try {
-            bodyBytes  = msgBody.getBytes("ISO-8859-1");
-            xmlContent = extractXmlFromBytes(bodyBytes);
-            // Sanity check: result must look like XML
-            if (NOT reFindNoCase("^\s*<\?xml|^\s*<feedback", xmlContent)) {
+                logLine("  RUA: error extracting attachment #att.name#: #attErr.message#", "WARN");
                 xmlContent = "";
             }
-        } catch(any bodyErr) {
-            xmlContent = "";
+            if (len(trim(xmlContent))) break;
+        } else if (structKeyExists(att, "file") AND fileExists(att.file)) {
+            try {
+                var rawFileBytes = fileReadBinary(att.file);
+                xmlContent = extractXmlFromBytes(rawFileBytes);
+                if (NOT reFindNoCase("^\s*<\?xml|^\s*<feedback", xmlContent)) xmlContent = "";
+            } catch(any attErr) {
+                logLine("  RUA: error reading attachment file #att.name#: #attErr.message#", "WARN");
+            }
+            try { fileDelete(att.file); } catch(any e) {}
+            if (len(trim(xmlContent))) break;
         }
     }
 
@@ -219,7 +215,7 @@
         spfResult     = getNodeText(rec, "auth_results.spf.result");
 
         isIPv6addr = find(":", sourceIP) GT 0;
-        ipColSQL   = isIPv6addr ? "ip6"        : "ip";
+        ipColSQL   = isIPv6addr ? "ip6"          : "ip";
         ipValSQL   = isIPv6addr ? "INET6_ATON(?)" : "INET_ATON(?)";
 
         optCols   = "";
