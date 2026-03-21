@@ -10,18 +10,23 @@
       duplicate skip; it never fires on error.
 
       Architecture:
-        - cfimap getHeaderOnly  : list messages, get UIDs and Message-IDs for dedup
-        - doveadm fetch         : retrieve hdr + body per UID (fields: "hdr body")
-        - extractDmarcAttachment: parse raw MIME body, locate ZIP/GZ/XML part,
-                                  base64-decode only the attachment payload
-        - extractXmlFromBytes   : decompress ZIP/GZ in parse_rua.cfm
+        Password accounts (local Dovecot):
+          - cfimap getHeaderOnly  : list messages, get UIDs and Message-IDs for dedup
+          - doveadm fetch         : retrieve hdr + body per UID (fields: "hdr body")
+          - extractDmarcAttachment: parse raw MIME body, locate ZIP/GZ/XML part,
+                                    base64-decode only the attachment payload
+          - extractXmlFromBytes   : decompress ZIP/GZ in parse_rua.cfm
+
+        OAuth2 accounts (Gmail):
+          - fetch_gmail.cfm       : token refresh, Gmail REST API list/fetch,
+                                    base64url-decode attachments from payload tree
 
       Why doveadm instead of Jakarta Mail:
         Jakarta Mail StreamProvider SPI cannot be bootstrapped in Lucee's OSGi
         classloader context. doveadm is a local process with no such constraints.
 
       Note: doveadm path only works for local Dovecot accounts on this server.
-      OAuth2/Gmail accounts need a different fetch mechanism (future work).
+      Gmail accounts use fetch_gmail.cfm via the Gmail REST API.
 --->
 <cfinclude template="/includes/functions.cfm">
 
@@ -311,8 +316,11 @@
 
         try {
 
+            // OAuth2 accounts (Gmail) use the Gmail REST API path.
+            // fetch_gmail.cfm runs its own message loop and updates
+            // totalNew/totalSkip/totalError directly, then returns.
             if (acct.auth_type EQ "oauth2") {
-                logLine("  OAuth2 accounts not yet supported via doveadm — skipping", "WARN");
+                include "/poller/fetch_gmail.cfm";
                 continue;
             }
 
