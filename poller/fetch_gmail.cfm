@@ -12,10 +12,11 @@
       For each unprocessed message this file:
         1. Ensures a valid access token (refreshes if needed)
         2. Lists message IDs via Gmail API
-        3. Deduplicates via Message-ID header before fetching bodies
-        4. Populates attachments[], cleanMsgId, msgSubject, contentType
-        5. Includes parse_rua.cfm or parse_ruf.cfm exactly as the doveadm path does
-        6. Marks messages read and/or deletes them per poller settings
+        3. Fetches metadata only (headers, no payload) for deduplication
+        4. Skips already-seen messages cheaply — no full payload download
+        5. Fetches full payload only for genuinely new messages
+        6. Includes parse_rua.cfm or parse_ruf.cfm exactly as the doveadm path does
+        7. Marks messages read and/or deletes them per poller settings
 
       Gmail API base: https://gmail.googleapis.com/gmail/v1/users/me
 
@@ -39,7 +40,7 @@
         B) single-part with inline data — payload.body.data (base64url)
         C) single-part with large attachment — payload.body.attachmentId,
            payload.body.data is absent or empty (Google DMARC reports use this)
-      All three shapes are handled in Step 5 of the main loop.
+      All three shapes are handled in the full-fetch branch.
 --->
 <cfscript>
 
@@ -326,6 +327,12 @@
     // Main Gmail fetch loop
     // Replaces the doveadm path for this account.
     //
+    // Two-pass strategy per message:
+    //   Pass 1 (metadata): fetch headers only — cheap, used for dedup check.
+    //   Pass 2 (full):     fetch complete payload — only for new messages.
+    // This means already-processed messages cost one lightweight API call
+    // instead of a full payload download, which matters during backlog drain.
+    //
     // IMPORTANT: No var declarations at page scope — Lucee only allows var
     // inside functions. All loop variables are plain assignments.
     // =======================================================================
@@ -394,25 +401,18 @@
 
                     try {
 
-                        // Step 3: fetch full message (headers + payload)
-                        gmailMsg = gmailApiGet(
-                            gmailToken,
-                            "messages/#gmailMsgId#",
-                            { "format": "full" }
-                        );
+                        // Pass 1: metadata fetch — headers only, no payload.
+                        // Much faster than format=full; used for dedup check only.
+                        gmailMeta    = gmailApiGet(gmailToken, "messages/#gmailMsgId#", { "format": "metadata" });
+                        metaHeaders  = structKeyExists(gmailMeta, "payload") AND structKeyExists(gmailMeta.payload, "headers")
+                                       ? gmailMeta.payload.headers : [];
 
-                        gmailPayload = gmailMsg.payload ?: {};
-                        gmailHeaders = structKeyExists(gmailPayload, "headers") ? gmailPayload.headers : [];
-
-                        // Extract Message-ID for deduplication
-                        rawMsgId   = extractHeaderValue(gmailHeaders, "message-id");
+                        rawMsgId   = extractHeaderValue(metaHeaders, "message-id");
                         cleanMsgId = reReplace(trim(rawMsgId), "[<>\s]", "", "ALL");
                         if (NOT len(cleanMsgId)) cleanMsgId = "gmail-" & gmailMsgId;
 
-                        msgSubject  = extractHeaderValue(gmailHeaders, "subject");
-                        contentType = extractHeaderValue(gmailHeaders, "content-type");
-
-                        // Step 4: deduplicate
+                        // Dedup check — if already in DB, dispose and move on.
+                        // No full payload download needed.
                         qDupe = queryExecute(
                             "SELECT id FROM report WHERE message_id=? LIMIT 1",
                             [{ value: cleanMsgId, cfsqltype: "cf_sql_varchar" }],
@@ -429,7 +429,38 @@
                             continue;
                         }
 
-                        // Step 5: collect attachment bytes.
+                        // Pass 2: full fetch — only reached for new messages.
+                        gmailMsg     = gmailApiGet(gmailToken, "messages/#gmailMsgId#", { "format": "full" });
+                        gmailPayload = gmailMsg.payload ?: {};
+                        gmailHeaders = structKeyExists(gmailPayload, "headers") ? gmailPayload.headers : [];
+
+                        // Re-extract headers from full fetch (more complete than metadata)
+                        rawMsgId2  = extractHeaderValue(gmailHeaders, "message-id");
+                        cleanMsgId = len(trim(rawMsgId2))
+                                     ? reReplace(trim(rawMsgId2), "[<>\s]", "", "ALL")
+                                     : cleanMsgId;
+
+                        msgSubject  = extractHeaderValue(gmailHeaders, "subject");
+                        contentType = extractHeaderValue(gmailHeaders, "content-type");
+
+                        // Final dedup on full Message-ID (catches any metadata vs full discrepancy)
+                        qDupe = queryExecute(
+                            "SELECT id FROM report WHERE message_id=? LIMIT 1",
+                            [{ value: cleanMsgId, cfsqltype: "cf_sql_varchar" }],
+                            { datasource: application.db.dsn }
+                        );
+
+                        if (qDupe.recordCount) {
+                            logLine("  Gmail: #cleanMsgId# already in DB — skipping (full dedup)");
+                            gmailSkip++;
+                            totalSkip++;
+                            markGmailMessage(gmailToken, gmailMsgId,
+                                application.poller.markAsRead,
+                                structKeyExists(application.poller, "deleteAfter") AND application.poller.deleteAfter);
+                            continue;
+                        }
+
+                        // Collect attachment bytes.
                         // No var declarations — page scope, not function scope.
                         //
                         // Shape A: multipart — walk parts[] tree
@@ -481,7 +512,7 @@
                             continue;
                         }
 
-                        // Step 6: detect RUF vs RUA and parse
+                        // Detect RUF vs RUA and parse
                         isRUF = reFindNoCase("multipart/report", contentType)
                                 AND reFindNoCase("report-type=feedback-report", contentType);
 
@@ -493,7 +524,7 @@
                             include "/poller/parse_rua.cfm";
                         }
 
-                        // Step 7: dispose only after confirmed parse
+                        // Dispose only after confirmed parse
                         markGmailMessage(gmailToken, gmailMsgId,
                             application.poller.markAsRead,
                             structKeyExists(application.poller, "deleteAfter") AND application.poller.deleteAfter);
