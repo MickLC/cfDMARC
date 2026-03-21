@@ -379,9 +379,12 @@
             // Step 1: get a live access token
             gmailToken = getValidAccessToken(gmailAcct);
 
-            // Step 2: list unread messages in INBOX (batch-limited)
+            // Step 2: list unread messages across all labels except trash and spam.
+            // Using "is:unread -in:trash -in:spam" instead of "in:inbox is:unread"
+            // so that reports filed into labels like "Domain Reports" or
+            // "Abuse Reporting" by Gmail filters are also processed.
             gmailListParams = {
-                "q"          : "in:inbox is:unread",
+                "q"          : "is:unread -in:trash -in:spam",
                 "maxResults" : application.poller.batchSize
             };
 
