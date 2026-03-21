@@ -13,7 +13,7 @@
 <cfinclude template="/includes/functions.cfm">
 
 <cfscript>
-    // Token-based access control — safe behind AJP/reverse-proxy
+    // Token-based access control
     param name="url.token" default="";
     if (NOT structKeyExists(application, "poller")
         OR NOT structKeyExists(application.poller, "token")
@@ -347,5 +347,7 @@
     } catch(any logErr) {
         cflog(file="dmarc_poller", text="Failed to insert poller_run: #logErr.message#", type="error");
     }
+
+    // writeOutput inside cfscript bypasses any post-script output buffer issues
+    writeOutput("OK: " & totalNew & " new / " & totalSkip & " skipped / " & totalError & " errors");
 </cfscript>
-<cfoutput>OK: #totalNew# new / #totalSkip# skipped / #totalError# errors</cfoutput>
