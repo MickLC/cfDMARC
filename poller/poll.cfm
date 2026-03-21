@@ -7,6 +7,9 @@
       cfimap action reference (Lucee):
         getHeaderOnly  - fetch headers (subject, from, date, uid, messageNumber, header)
         getAll         - fetch full message + save attachments to attachmentPath
+                         NOTE: getAll ignores subdirectories and saves attachments
+                         directly into attachmentPath regardless of what you pass.
+                         We snapshot the dir before/after each call to detect new files.
         markRead       - mark message(s) read by uid
         open / close   - persistent named connection
 --->
@@ -34,6 +37,30 @@
         arrayAppend(pollLog, "[#ts#] [#arguments.level#] #arguments.msg#");
         cflog(file="dmarc_poller", text="[#arguments.level#] #arguments.msg#",
               type=(arguments.level EQ "ERROR" ? "error" : "information"));
+    }
+
+    // Return a set of filenames currently in a directory (files only, not dirs)
+    function dirSnapshot(required string path) {
+        var snap = {};
+        if (NOT directoryExists(arguments.path)) return snap;
+        var q = directoryList(arguments.path, false, "query");
+        for (var f in q) {
+            if (f.type EQ "File") snap[f.name] = true;
+        }
+        return snap;
+    }
+
+    // Return array of {name, file} for files in dirPath not in beforeSnap
+    function newFilesAfter(required string dirPath, required struct beforeSnap) {
+        var result = [];
+        if (NOT directoryExists(arguments.dirPath)) return result;
+        var q = directoryList(arguments.dirPath, false, "query", "*.xml|*.zip|*.gz");
+        for (var f in q) {
+            if (f.type EQ "File" AND NOT structKeyExists(arguments.beforeSnap, f.name)) {
+                arrayAppend(result, { name: f.name, file: f.directory & "/" & f.name });
+            }
+        }
+        return result;
     }
 
     logLine("=== Poll run started ===");
@@ -124,6 +151,7 @@
 
             mailbox    = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
             connLabel  = "dmarc_poll_#acct.id#";
+            // attachBase: cfimap getAll saves attachments here directly (ignores subdirs)
             attachBase = getTempDirectory() & "dmarc_poll/";
             if (NOT directoryExists(attachBase)) directoryCreate(attachBase);
 
@@ -225,16 +253,19 @@
 
                     } else {
 
-                        msgUID    = qHeaders.uid[msgIdx];
-                        attachDir = attachBase & "msg_" & msgUID & "/";
-                        if (NOT directoryExists(attachDir)) directoryCreate(attachDir);
+                        msgUID = qHeaders.uid[msgIdx];
+
+                        // Snapshot dir before getAll so we can detect newly added files.
+                        // cfimap getAll saves attachments directly into attachmentPath,
+                        // not into subdirectories, regardless of what path we give it.
+                        beforeSnap = dirSnapshot(attachBase);
 
                         cfimap(
                             action                  = "getAll",
                             connection              = connLabel,
                             folder                  = mailbox,
                             uid                     = msgUID,
-                            attachmentPath          = attachDir,
+                            attachmentPath          = attachBase,
                             generateUniqueFilenames = true,
                             name                    = "qMsg"
                         );
@@ -243,17 +274,10 @@
                         contentType  = qMsg.header;
                         msgMessageId = len(trim(qMsg.messageId)) ? qMsg.messageId : createUUID();
                         msgBody      = len(trim(qMsg.body)) ? qMsg.body : "";
-                        attachments  = [];
 
-                        if (directoryExists(attachDir)) {
-                            qAttFiles = directoryList(attachDir, false, "query", "*.xml|*.zip|*.gz");
-                            for (af in qAttFiles) {
-                                arrayAppend(attachments, {
-                                    name : af.name,
-                                    file : af.directory & "/" & af.name
-                                });
-                            }
-                        }
+                        // Find files added by this getAll call
+                        attachments  = newFilesAfter(attachBase, beforeSnap);
+                        logLine("  Found #arrayLen(attachments)# attachment(s) for uid=#msgUID#");
                     }
 
                     cleanMsgId = reReplace(trim(msgMessageId), "[<>\s]", "", "ALL");
@@ -285,6 +309,13 @@
                     } else {
                         logLine("  -> RUA (subject: #msgSubject#)");
                         include "/poller/parse_rua.cfm";
+                    }
+
+                    // Clean up attachment files after processing
+                    for (att in attachments) {
+                        if (structKeyExists(att, "file") AND fileExists(att.file)) {
+                            try { fileDelete(att.file); } catch(any e) {}
+                        }
                     }
 
                     if (application.poller.markAsRead) {
@@ -348,6 +379,5 @@
         cflog(file="dmarc_poller", text="Failed to insert poller_run: #logErr.message#", type="error");
     }
 
-    // writeOutput inside cfscript bypasses any post-script output buffer issues
     writeOutput("OK: " & totalNew & " new / " & totalSkip & " skipped / " & totalError & " errors");
 </cfscript>
