@@ -216,8 +216,6 @@
         required string gmailMsgId,
         required string accessToken
     ) {
-        var attachSize = val(arguments.body.size ?: 0);
-
         // Inline base64url data
         if (structKeyExists(arguments.body, "data") AND len(arguments.body.data)) {
             return b64urlDecode(arguments.body.data);
@@ -225,14 +223,13 @@
 
         // Large attachment — no inline data, must fetch by attachmentId
         if (structKeyExists(arguments.body, "attachmentId") AND len(arguments.body.attachmentId)) {
-            logLine("  Gmail: fetching attachment id=#arguments.body.attachmentId# size=#attachSize# msg=#arguments.gmailMsgId#", "INFO");
             var attData = gmailApiGet(
                 arguments.accessToken,
                 "messages/#arguments.gmailMsgId#/attachments/#arguments.body.attachmentId#"
             );
             if (structKeyExists(attData, "data") AND len(attData.data))
                 return b64urlDecode(attData.data);
-            logLine("  Gmail: attachment fetch returned no data id=#arguments.body.attachmentId#", "WARN");
+            logLine("  Gmail: attachment fetch returned no data id=#arguments.body.attachmentId# msg=#arguments.gmailMsgId#", "WARN");
             return javaCast("null", "");
         }
 
@@ -270,11 +267,7 @@
             if (reFindNoCase("application/(zip|gzip|x-zip|x-zip-compressed|x-gzip|octet-stream|xml)", mimeType)) isDmarc = true;
             if (reFindNoCase("\.(zip|gz|xml)$", filename)) isDmarc = true;
 
-            if (NOT isDmarc) {
-                if (len(filename) OR len(mimeType))
-                    logLine("  Gmail: skipping part mime=#mimeType# file=#filename# msg=#arguments.gmailMsgId#", "INFO");
-                continue;
-            }
+            if (NOT isDmarc) continue;
 
             var bodyBytes = javaCast("null", "");
             try {
@@ -368,8 +361,7 @@
             // Step 1: get a live access token
             gmailToken = getValidAccessToken(gmailAcct);
 
-            // Step 2: list unread messages in INBOX (batch-limited).
-            // Quoted keys to avoid Lucee mangling underscored keys in struct literals.
+            // Step 2: list unread messages in INBOX (batch-limited)
             gmailListParams = {
                 "q"          : "in:inbox is:unread",
                 "maxResults" : application.poller.batchSize
@@ -457,7 +449,7 @@
                             }
 
                         } else if (structKeyExists(gmailPayload, "body") AND isStruct(gmailPayload.body)) {
-                            // Shape B or C: single-part — check MIME type then fetch bytes
+                            // Shape B or C: single-part
                             isDmarcTopLevel = false;
                             if (reFindNoCase("application/(zip|gzip|x-zip|x-gzip|octet-stream|xml)", topMime)) isDmarcTopLevel = true;
                             if (reFindNoCase("\.(zip|gz|xml)$", topFile)) isDmarcTopLevel = true;
@@ -472,7 +464,7 @@
                                 if (NOT isNull(topBytes) AND arrayLen(topBytes) GT 4)
                                     arrayAppend(attachments, { name: "report", bytes: topBytes });
                             } else {
-                                logLine("  Gmail: msg=#gmailMsgId# single-part but not a DMARC MIME type: #topMime#", "WARN");
+                                logLine("  Gmail: msg=#gmailMsgId# single-part non-DMARC mime type: #topMime#", "WARN");
                             }
 
                         } else {
@@ -531,7 +523,7 @@
 
         } catch(any acctErr) {
             logLine("  Gmail ACCOUNT ERROR (#acct.label#): #acctErr.message# | #acctErr.detail#", "ERROR");
-            totalError++; 
+            totalError++;
             queryExecute(
                 "UPDATE imap_accounts SET last_status=? WHERE id=?",
                 [
