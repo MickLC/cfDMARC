@@ -40,17 +40,15 @@
     ", {}, { datasource: application.db.dsn });
 
     // Trend chart: daily for <=90 days, weekly for 365/all-time.
-    // For "all time" (filterDays=0) there's no date WHERE clause, so we
-    // use a separate trendDateClause that's always present for the trend query.
     useWeeklyTrend  = (filterDays EQ 0 OR filterDays EQ 365);
     trendDateClause = filterDays GT 0 ? "WHERE rpt.mindate >= DATE_SUB(NOW(), INTERVAL #filterDays# DAY)" : "";
 
     if (useWeeklyTrend) {
-        trendGroupExpr  = "DATE(DATE_SUB(rpt.mindate, INTERVAL WEEKDAY(rpt.mindate) DAY))"; // Monday of the week
-        trendLabelExpr  = "DATE_FORMAT(DATE_SUB(rpt.mindate, INTERVAL WEEKDAY(rpt.mindate) DAY), '%b %d')";
+        trendGroupExpr = "DATE(DATE_SUB(rpt.mindate, INTERVAL WEEKDAY(rpt.mindate) DAY))";
+        trendLabelExpr = "DATE_FORMAT(DATE_SUB(rpt.mindate, INTERVAL WEEKDAY(rpt.mindate) DAY), '%b %d')";
     } else {
-        trendGroupExpr  = "DATE(rpt.mindate)";
-        trendLabelExpr  = "DATE_FORMAT(rpt.mindate, '%b %d')";
+        trendGroupExpr = "DATE(rpt.mindate)";
+        trendLabelExpr = "DATE_FORMAT(rpt.mindate, '%b %d')";
     }
 
     qTrend = queryExecute("
@@ -73,18 +71,18 @@
         arrayAppend(chartPassRate, row.messages GT 0 ? numberFormat(100*row.pass_count/row.messages, "99.9") : 0);
     }
 
-    // Chart title mirrors the date filter label
     chartTitle = useWeeklyTrend
         ? "Message Volume & Pass Rate — #dateLabel# (weekly)"
         : "Message Volume & Pass Rate — #dateLabel#";
 
+    // Recent reports ordered by report date (mindate), not ingestion time
     qRecent = queryExecute("
-        SELECT rpt.id, rpt.domain, rpt.org, rpt.received_at,
+        SELECT rpt.id, rpt.domain, rpt.org, rpt.mindate, rpt.maxdate,
             SUM(rec.rcount) AS message_count,
             SUM(CASE WHEN rec.dkim_align='pass' OR rec.spf_align='pass' THEN rec.rcount ELSE 0 END) AS pass_count
         FROM report rpt
         LEFT JOIN rptrecord rec ON rec.report_id = rpt.id
-        GROUP BY rpt.id ORDER BY rpt.received_at DESC LIMIT 10
+        GROUP BY rpt.id ORDER BY rpt.mindate DESC LIMIT 10
     ", {}, { datasource: application.db.dsn });
 
     qFailSources = queryExecute("
@@ -172,7 +170,7 @@
             <a href="/admin/reporters.cfm" style="font-size:0.72rem;color:var(--accent-blue);text-decoration:none;">View all</a>
         </div>
         <div class="card-body p-0"><table class="table mb-0">
-            <thead><tr><th>Domain</th><th>Reporter</th><th>Messages</th><th>Pass</th><th>Received</th></tr></thead>
+            <thead><tr><th>Domain</th><th>Reporter</th><th>Messages</th><th>Pass</th><th>Report Date</th></tr></thead>
             <tbody>
             <cfloop query="qRecent">
                 <cfset recRate = qRecent.message_count GT 0 ? int(100*qRecent.pass_count/qRecent.message_count) : 0>
@@ -181,7 +179,9 @@
                     <td style="color:var(--text-secondary)">#qRecent.org#</td>
                     <td class="mono">#formatNumber(qRecent.message_count)#</td>
                     <td><span class="badge badge-#(recRate GTE 95 ? 'pass':(recRate GTE 75 ? 'warn':'fail'))#">#recRate#%</span></td>
-                    <td style="color:var(--text-muted);font-size:0.78rem;" class="mono">#timeAgo(qRecent.received_at)#</td>
+                    <td style="color:var(--text-muted);font-size:0.78rem;" class="mono">
+                        #dateFormat(qRecent.mindate, "mmm d")#<cfif dateFormat(qRecent.mindate, "mmm d") NEQ dateFormat(qRecent.maxdate, "mmm d")>–#dateFormat(qRecent.maxdate, "mmm d")#</cfif>
+                    </td>
                 </tr>
             </cfloop>
             </tbody>
