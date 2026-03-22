@@ -17,6 +17,8 @@
         var b0 = rawBytes[1]; if (b0 LT 0) b0 = b0 + 256;
         var b1 = rawBytes[2]; if (b1 LT 0) b1 = b1 + 256;
 
+        var result = "";
+
         if (b0 EQ 31 AND b1 EQ 139) {
             // GZIP
             var bis  = createObject("java","java.io.ByteArrayInputStream").init(rawBytes);
@@ -27,7 +29,7 @@
             var line = br.readLine();
             while (NOT isNull(line)) { sb.append(line); sb.append(chr(10)); line = br.readLine(); }
             br.close();
-            return sb.toString();
+            result = sb.toString();
 
         } else if (b0 EQ 80 AND b1 EQ 75) {
             // ZIP — first XML entry wins
@@ -43,17 +45,29 @@
                     var line = br.readLine();
                     while (NOT isNull(line)) { sb.append(line); sb.append(chr(10)); line = br.readLine(); }
                     zis.close();
-                    return sb.toString();
+                    result = sb.toString();
+                    break;
                 }
                 entry = zis.getNextEntry();
             }
-            zis.close();
-            throw(type="DMARCPoller", message="No XML entry found in ZIP attachment");
+            if (NOT len(result)) {
+                zis.close();
+                throw(type="DMARCPoller", message="No XML entry found in ZIP attachment");
+            }
 
         } else {
             // Assume raw UTF-8 XML (e.g. some senders send uncompressed XML)
-            return createObject("java","java.lang.String").init(rawBytes, "UTF-8");
+            result = createObject("java","java.lang.String").init(rawBytes, "UTF-8");
         }
+
+        // Strip UTF-8 BOM (U+FEFF) if present. Some senders (notably Microsoft)
+        // emit a BOM before the XML declaration. Java's regex \s* does not match
+        // U+FEFF, so the BOM must be removed before the validity check and xmlParse().
+        if (len(result) AND asc(left(result, 1)) EQ 65279) {
+            result = mid(result, 2, len(result) - 1);
+        }
+
+        return result;
     }
 
     function getNodeText(required any xmlNode, required string path, string defaultVal="") {
