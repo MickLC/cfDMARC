@@ -1,6 +1,6 @@
 <!--- admin/backfill_records.cfm
       One-time tool to backfill rptrecord rows for all report rows that
-      have raw_reports XML but 0 associated rptrecord rows.
+      have raw_xml content but 0 associated rptrecord rows.
 
       This repairs the historical dataset affected by the XmlName case bug:
       Lucee returns XmlName in uppercase, so "child.XmlName NEQ 'record'"
@@ -42,17 +42,17 @@
 
     // -----------------------------------------------------------------------
     // Count total reports that still need backfilling.
-    // A report "needs backfilling" if it has raw_reports content but has
-    // no rows in rptrecord.  We re-count on every batch load so the display
-    // accurately reflects what prior batches already completed.
+    // A report "needs backfilling" if it has raw_xml content but has no rows
+    // in rptrecord. We re-count on every batch load so the display accurately
+    // reflects what prior batches already completed.
     // -----------------------------------------------------------------------
     qTotalNeeded = queryExecute(
         "SELECT COUNT(*) AS cnt
          FROM   report r
-         WHERE  r.raw_reports IS NOT NULL
-           AND  r.raw_reports <> ''
+         WHERE  r.raw_xml IS NOT NULL
+           AND  r.raw_xml <> ''
            AND  NOT EXISTS (
-                    SELECT 1 FROM rptrecord rr WHERE rr.report_id = r.serial
+                    SELECT 1 FROM rptrecord rr WHERE rr.report_id = r.id
                 )",
         {},
         { datasource: application.db.dsn }
@@ -63,14 +63,14 @@
     // Fetch this batch.
     // -----------------------------------------------------------------------
     qBatch = queryExecute(
-        "SELECT r.serial, r.domain, r.org, r.raw_reports
+        "SELECT r.id, r.domain, r.org, r.raw_xml
          FROM   report r
-         WHERE  r.raw_reports IS NOT NULL
-           AND  r.raw_reports <> ''
+         WHERE  r.raw_xml IS NOT NULL
+           AND  r.raw_xml <> ''
            AND  NOT EXISTS (
-                    SELECT 1 FROM rptrecord rr WHERE rr.report_id = r.serial
+                    SELECT 1 FROM rptrecord rr WHERE rr.report_id = r.id
                 )
-         ORDER  BY r.serial ASC
+         ORDER  BY r.id ASC
          LIMIT  ? OFFSET ?",
         [
             { value: batchSize, cfsqltype: "cf_sql_integer" },
@@ -91,7 +91,7 @@
 
         try {
             // Strip UTF-8 BOM if present (same fix as parse_rua.cfm)
-            xmlStr = row.raw_reports;
+            xmlStr = row.raw_xml;
             if (len(xmlStr) AND asc(left(xmlStr, 1)) EQ 65279) {
                 xmlStr = mid(xmlStr, 2, len(xmlStr) - 1);
             }
@@ -136,7 +136,7 @@
                 if (len(spfResult))     { optCols &= ", spfresult";  optVals &= ", ?"; arrayAppend(optParams, { value: left(spfResult,20),      cfsqltype: "cf_sql_varchar" }); }
 
                 baseParams = [
-                    { value: row.serial,           cfsqltype: "cf_sql_integer" },
+                    { value: row.id,               cfsqltype: "cf_sql_integer" },
                     { value: sourceIP,             cfsqltype: "cf_sql_varchar" },
                     { value: rcount,               cfsqltype: "cf_sql_integer" },
                     { value: left(disposition,20), cfsqltype: "cf_sql_varchar" },
@@ -166,7 +166,7 @@
         } catch(any e) {
             cntFail++;
             arrayAppend(failDetails, {
-                serial : row.serial,
+                id     : row.id,
                 org    : row.org,
                 domain : row.domain,
                 error  : left(e.message, 200)
@@ -206,7 +206,7 @@
         <p class="bf-intro">
             Repairs reports affected by the <code>XmlName</code> case bug — every report
             inserted before the fix has a header row but 0 record rows.
-            Reads <code>raw_reports</code> XML from each affected row and inserts the missing
+            Reads <code>raw_xml</code> from each affected row and inserts the missing
             <code>rptrecord</code> entries. Safe to re-run; reports that already have records
             are skipped automatically.
         </p>
@@ -244,7 +244,7 @@
             <cfif arrayLen(failDetails)>
                 <div class="section-hd">Parse failures this batch</div>
                 <p style="font-size:.8rem;color:var(--text-muted);margin-bottom:.5rem;">
-                    These reports had unparseable XML in <code>raw_reports</code>. They will be skipped
+                    These reports had unparseable XML in <code>raw_xml</code>. They will be skipped
                     permanently on future runs since they'll never acquire record rows.
                     To recover them you'd need to re-ingest from the original email attachments.
                 </p>
@@ -254,7 +254,7 @@
                     <cfloop array="#failDetails#" item="f">
                         <cfoutput>
                         <tr>
-                            <td>#f.serial#</td>
+                            <td>#f.id#</td>
                             <td>#htmlEditFormat(f.org)#</td>
                             <td>#htmlEditFormat(f.domain)#</td>
                             <td class="err-msg">#htmlEditFormat(f.error)#</td>
