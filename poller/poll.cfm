@@ -12,7 +12,7 @@
       Architecture:
         Password accounts (local Dovecot):
           - doveadm search UNSEEN : get UIDs of unseen messages (avoids cfimap
-                                    maxRows pagination problem — cfimap always
+                                    maxRows pagination problem - cfimap always
                                     returns the first N messages, not the first N
                                     unseen ones)
           - cfimap getHeaderOnly  : fetch headers for specific unseen UIDs only
@@ -35,11 +35,20 @@
       Gmail accounts use fetch_gmail.cfm via the Gmail REST API.
 
       Variables consumed by parse_ruf.cfm / parse_rua.cfm (set below):
-        msgBody      — raw MIME body text (RUF); not used by parse_rua.cfm
-        msgSubject   — subject line
-        cleanMsgId   — deduplicated Message-ID string
-        attachments  — array of { name, bytes } structs (RUA); may be empty for RUF
-        acct         — current imap_accounts row
+        msgBody      - raw MIME body text (RUF); not used by parse_rua.cfm
+        msgSubject   - subject line
+        cleanMsgId   - deduplicated Message-ID string
+        attachments  - array of { name, bytes } structs (RUA); may be empty for RUF
+        acct         - current imap_accounts row
+
+      Lucee string-literal gotchas in this file:
+        - Do NOT put a literal " (double-quote) inside a double-quoted CFML
+          string that is passed to a regex function. Lucee's lexer treats the
+          second " as the closing delimiter even inside a character class [...].
+          Use chr(34) to embed a literal double-quote in regex patterns.
+        - Do NOT use \s, \r, \n, \t inside double-quoted CFML string literals.
+          Lucee's string parser consumes the backslash, so the regex engine
+          never sees the escape sequence. Use [ \t] or chr() alternatives.
 --->
 <cfinclude template="/includes/functions.cfm">
 
@@ -77,10 +86,6 @@
     // Called after a message has been successfully handled (inserted or confirmed
     // duplicate). Applies markAsRead and/or deleteAfter per settings.
     // Never called on error paths so we never discard a message we failed to store.
-    //
-    // markRead uses doveadm flags add \Seen rather than cfimap action="markRead".
-    // Lucee's cfimap markRead silently does nothing against a real Dovecot server;
-    // doveadm is the same reliable path we already use for fetching message bodies.
     // -----------------------------------------------------------------------
     function disposeMessage(required string username, required string mailbox, required string uid) {
         if (application.poller.markAsRead) {
@@ -108,11 +113,7 @@
     // -----------------------------------------------------------------------
     // getUnseenUids(username, mailbox, maxCount)
     //
-    // Uses doveadm search to return an array of UID strings for unseen messages,
-    // limited to maxCount. This is the correct way to find unread messages in
-    // Lucee/Dovecot: cfimap getHeaderOnly with maxRows always returns the first
-    // N messages regardless of seen status, so it can never page past a block
-    // of already-seen messages at the start of the mailbox.
+    // Uses doveadm search to return an array of UID strings for unseen messages.
     // -----------------------------------------------------------------------
     function getUnseenUids(required string username, required string mailbox, required numeric maxCount) {
         var searchOut = "";
@@ -129,8 +130,6 @@
             logLine("  getUnseenUids: doveadm search error: #e.message#", "WARN");
             return uids;
         }
-        // doveadm search returns "mailboxId uid" pairs, one per line.
-        // We only need the uid (second token on each line).
         for (var line in listToArray(trim(searchOut), chr(10))) {
             line = trim(reReplace(line, chr(13), "", "ALL"));
             if (NOT len(line)) continue;
@@ -143,10 +142,6 @@
 
     // -----------------------------------------------------------------------
     // splitOnLiteral(str, delimiter)
-    //
-    // CFML's listToArray treats each CHARACTER of the delimiter as a separate
-    // split token. For multi-character delimiters like MIME boundaries we must
-    // use Java's String.split() with a regex-escaped delimiter instead.
     // -----------------------------------------------------------------------
     function splitOnLiteral(required string str, required string delim) {
         var pattern = createObject("java","java.util.regex.Pattern").quote(arguments.delim);
@@ -159,24 +154,21 @@
     // -----------------------------------------------------------------------
     // extractDmarcAttachment(mimeBody, topHeaders)
     //
-    // Given raw doveadm output sections, locate and base64-decode the DMARC
-    // attachment bytes. Handles:
-    //   Path 1: Top-level Content-Type is the attachment (Google single-part)
-    //   Path 2: multipart/* - split on boundary, find attachment MIME part
-    //   Path 3: fallback - try treating entire body as flat base64
+    // Locate and base64-decode the DMARC attachment bytes from a raw MIME body.
+    // NOT called for RUF messages (no attachment; body is the report).
     //
-    // Uses splitOnLiteral() for boundary splitting; listToArray() mishandles
-    // multi-character delimiters by treating each char as a separate token.
-    //
-    // NOTE: Not called for RUF messages. RUF reports are multipart/report
-    // emails; their content is in the message body, not in a ZIP/GZ attachment.
-    // parse_ruf.cfm receives msgBody (= fetched.body) directly.
+    // IMPORTANT: All regex patterns here avoid embedding literal " (double-quote)
+    // inside CFML double-quoted string literals - Lucee's lexer would treat the
+    // embedded " as the string closing delimiter, causing a compile error.
+    // Double-quotes are injected via chr(34) where needed. Similarly, \s/\r/\n
+    // are replaced with chr() or explicit character classes.
     // -----------------------------------------------------------------------
     function extractDmarcAttachment(required string mimeBody, required string topHeaders) {
 
+        // Parse RFC 2822 header block into a lowercase-keyed struct.
         function parseHeaders(required string hdrs) {
             var result   = {};
-            var unfolded = reReplace(arguments.hdrs, "(#chr(13)##chr(10)#|#chr(10)#)[ #chr(9)#]+", " ", "ALL");
+            var unfolded = reReplace(arguments.hdrs, "(" & chr(13) & chr(10) & "|" & chr(10) & ")[ " & chr(9) & "]+", " ", "ALL");
             for (var line in listToArray(unfolded, chr(10))) {
                 line = reReplace(line, chr(13), "", "ALL");
                 var colon = find(":", line);
@@ -187,10 +179,18 @@
             return result;
         }
 
+        // Extract boundary parameter value from a Content-Type header value.
+        // Pattern: boundary=value  or  boundary='value'  (single-quote delimited)
+        // Double-quotes avoided in character classes - use chr(34) if ever needed.
+        // \s replaced with [ \t] to survive Lucee string-literal parsing.
         function getBoundary(required string ctValue) {
-            var m = reFind("(?i)boundary=[\"']?([^\"';\s,]+)[\"']?", arguments.ctValue, 1, true);
-            if (m.len[1] GT 0 AND arrayLen(m.len) GT 1)
-                return mid(arguments.ctValue, m.pos[2], m.len[2]);
+            var pat = "(?i)boundary=([^'" & chr(34) & "; " & chr(9) & ",]+)";
+            var m   = reFind(pat, arguments.ctValue, 1, true);
+            if (m.len[1] GT 0 AND arrayLen(m.len) GT 1) {
+                // Strip surrounding single-quotes if present
+                var val = mid(arguments.ctValue, m.pos[2], m.len[2]);
+                return reReplace(val, "^'|'$", "", "ALL");
+            }
             return "";
         }
 
@@ -201,16 +201,25 @@
             return false;
         }
 
+        // Extract filename from Content-Disposition and Content-Type header values.
+        // Avoids embedding " in character classes; uses chr(34) instead.
         function getFilename(required string cd, required string ct) {
             var combined = arguments.cd & " " & arguments.ct;
-            var m = reFind("(?i)filename=[\"']?([^\"';\r\n]+)[\"']?", combined, 1, true);
-            if (m.len[1] GT 0 AND arrayLen(m.len) GT 1)
-                return trim(reReplace(mid(combined, m.pos[2], m.len[2]), "[\"']", "", "ALL"));
+            // Pattern: filename=value  where value may be single- or double-quoted
+            var pat = "(?i)filename=([^" & chr(34) & "'; " & chr(9) & chr(13) & chr(10) & "]+)";
+            var m   = reFind(pat, combined, 1, true);
+            if (m.len[1] GT 0 AND arrayLen(m.len) GT 1) {
+                var val = mid(combined, m.pos[2], m.len[2]);
+                // Strip surrounding single- or double-quotes
+                return trim(reReplace(val, "^[" & chr(34) & "']|[" & chr(34) & "']$", "", "ALL"));
+            }
             return "";
         }
 
+        // base64-decode a string payload to byte[]
+        // Whitespace stripping uses chr() calls to avoid \s mangling.
         function b64decode(required string payload) {
-            var clean = reReplace(arguments.payload, "\s+", "", "ALL");
+            var clean = reReplace(arguments.payload, "[ " & chr(9) & chr(13) & chr(10) & "]+", "", "ALL");
             if (NOT len(clean)) return javaCast("null","");
             return createObject("java","java.util.Base64").getDecoder().decode(clean);
         }
@@ -287,7 +296,6 @@
         }
 
         // Path 3: fallback - try entire body as flat base64
-        // Reaching here means no standard attachment path worked; log for diagnostics
         logLine("  MIME: unexpected structure CT=[#left(topCT,60)#] boundary=[#boundary#] bodyLen=#len(arguments.mimeBody)#", "WARN");
         try {
             var dec = b64decode(arguments.mimeBody);
@@ -299,11 +307,6 @@
 
     // -----------------------------------------------------------------------
     // fetchViaDoveadm - retrieve raw hdr + body for one UID via doveadm.
-    //
-    // doveadm exits non-zero when a UID no longer exists (deleted between
-    // search and fetch). We omit errorvariable to avoid Lucee scope issues,
-    // use terminateOnTimeout=false to suppress throws, and treat empty output
-    // as a soft skip.
     // -----------------------------------------------------------------------
     function fetchViaDoveadm(required string username, required string mailbox, required string uid) {
         var result   = { body:"", headers:"", contentType:"", messageId:"" };
@@ -327,8 +330,6 @@
             return result;
         }
 
-        // Locate "hdr:" and "body:" section labels using literal string search.
-        // Regex is unreliable with mixed CRLF/LF line endings in Lucee's POSIX engine.
         var hdrLabel  = (find("hdr:" & chr(13) & chr(10), fetchOut) GT 0)
                         ? "hdr:"  & chr(13) & chr(10)
                         : "hdr:"  & chr(10);
@@ -350,14 +351,19 @@
             result.body = mid(fetchOut, bodyPos + len(bodyLabel), len(fetchOut));
         }
 
-        // Unfold RFC 2822 headers, then extract Content-Type and Message-ID
-        var unfolded = reReplace(result.headers, "(#chr(13)##chr(10)#|#chr(10)#)[ #chr(9)#]+", " ", "ALL");
+        // Unfold RFC 2822 headers then extract Content-Type and Message-ID.
+        // Use chr()-based unfolding to avoid \r\n mangling.
+        var unfolded = reReplace(result.headers,
+            "(" & chr(13) & chr(10) & "|" & chr(10) & ")[ " & chr(9) & "]+", " ", "ALL");
 
-        var ctMatch = reFind("(?i)Content-Type:\s*([^\r\n]+)", unfolded, 1, true);
+        // Content-Type: match to end of line (no \r or \n in char class)
+        var ctPat = "(?i)Content-Type:[ " & chr(9) & "]*([^" & chr(13) & chr(10) & "]+)";
+        var ctMatch = reFind(ctPat, unfolded, 1, true);
         if (ctMatch.len[1] GT 0 AND arrayLen(ctMatch.len) GT 1)
             result.contentType = trim(mid(unfolded, ctMatch.pos[2], ctMatch.len[2]));
 
-        var midMatch = reFind("(?i)Message-ID:\s*([^\r\n]+)", unfolded, 1, true);
+        var midPat = "(?i)Message-ID:[ " & chr(9) & "]*([^" & chr(13) & chr(10) & "]+)";
+        var midMatch = reFind(midPat, unfolded, 1, true);
         if (midMatch.len[1] GT 0 AND arrayLen(midMatch.len) GT 1)
             result.messageId = trim(mid(unfolded, midMatch.pos[2], midMatch.len[2]));
 
@@ -386,9 +392,6 @@
 
         try {
 
-            // OAuth2 accounts (Gmail) use the Gmail REST API path.
-            // fetch_gmail.cfm runs its own message loop and updates
-            // totalNew/totalSkip/totalError directly, then returns.
             if (acct.auth_type EQ "oauth2") {
                 include "/poller/fetch_gmail.cfm";
                 continue;
@@ -396,11 +399,6 @@
 
             mailbox = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
 
-            // Get UIDs of unseen messages via doveadm search.
-            // We do NOT use cfimap getHeaderOnly with a seen-filter because
-            // cfimap maxRows always returns the first N messages in the mailbox
-            // regardless of seen status — it cannot page past a block of
-            // already-seen messages at the start of the mailbox.
             unseenUids = getUnseenUids(acct.username, mailbox, application.poller.batchSize);
             msgCount   = arrayLen(unseenUids);
             logLine("#msgCount# unseen message(s) in mailbox");
@@ -417,7 +415,6 @@
                 continue;
             }
 
-            // Open IMAP connection - needed for cfimap getHeaderOnly per-UID
             imapPassword = decryptValue(acct.password);
             cfimap(
                 action     = "open",
@@ -433,8 +430,6 @@
             for (msgUID in unseenUids) {
 
                 try {
-                    // Fetch header for this specific UID to get Message-ID for dedup.
-                    // uid attribute on cfimap getHeaderOnly fetches exactly one message.
                     cfimap(
                         action     = "getHeaderOnly",
                         connection = "poll_#acct.id#",
@@ -445,12 +440,14 @@
 
                     msgSubject = qOneHeader.recordCount ? qOneHeader.subject[1] : "";
 
-                    // Quick dedup via Message-ID (avoids doveadm fetch round-trip)
                     rawHdr     = qOneHeader.recordCount ? qOneHeader.header[1] : "";
-                    midMatch   = reFind("(?i)Message-ID:\s*([^\r\n]+)", rawHdr, 1, true);
-                    quickMsgId = "";
+                    // Message-ID: to end of line, no \r\n in char class
+                    var midPat2  = "(?i)Message-ID:[ " & chr(9) & "]*([^" & chr(13) & chr(10) & "]+)";
+                    midMatch     = reFind(midPat2, rawHdr, 1, true);
+                    quickMsgId   = "";
                     if (midMatch.len[1] GT 0 AND arrayLen(midMatch.len) GT 1)
-                        quickMsgId = reReplace(trim(mid(rawHdr, midMatch.pos[2], midMatch.len[2])), "[<>\s]", "", "ALL");
+                        quickMsgId = reReplace(trim(mid(rawHdr, midMatch.pos[2], midMatch.len[2])),
+                                               "[<> " & chr(9) & chr(13) & chr(10) & "]+", "", "ALL");
 
                     if (len(quickMsgId)) {
                         qDupe = queryExecute("SELECT id FROM report WHERE message_id=? LIMIT 1",
@@ -467,19 +464,18 @@
                     fetched      = fetchViaDoveadm(acct.username, mailbox, msgUID);
                     contentType  = fetched.contentType;
                     attachments  = [];
-                    msgBody      = fetched.body;  // needed by parse_ruf.cfm
+                    msgBody      = fetched.body;
                     msgMessageId = len(fetched.messageId) ? fetched.messageId : (len(quickMsgId) ? quickMsgId : createUUID());
 
                     if (NOT len(trim(fetched.body))) {
-                        // doveadm returned nothing - UID was deleted after search
                         totalSkip++;
                         continue;
                     }
 
-                    cleanMsgId = reReplace(trim(msgMessageId), "[<>\s]", "", "ALL");
+                    cleanMsgId = reReplace(trim(msgMessageId),
+                                           "[<> " & chr(9) & chr(13) & chr(10) & "]+", "", "ALL");
                     if (NOT len(cleanMsgId)) cleanMsgId = createUUID();
 
-                    // Final dedup on full Message-ID
                     qDupe = queryExecute("SELECT id FROM report WHERE message_id=? LIMIT 1",
                         [{value:cleanMsgId, cfsqltype:"cf_sql_varchar"}],
                         {datasource:application.db.dsn});
@@ -495,13 +491,9 @@
                     if (NOT isRUF AND len(fetched.headers)) isRUF = reFindNoCase("feedback-report", fetched.headers);
 
                     if (isRUF) {
-                        // RUF: the ARF content is in the message body itself.
-                        // parse_ruf.cfm uses msgBody (= fetched.body) directly.
-                        // There is no ZIP/GZ attachment to extract.
                         logLine("  uid=#msgUID# -> RUF");
                         include "/poller/parse_ruf.cfm";
                     } else {
-                        // RUA: find the ZIP/GZ/XML attachment bytes.
                         try {
                             rawBytes = extractDmarcAttachment(fetched.body, fetched.headers);
                             if (NOT isNull(rawBytes) AND arrayLen(rawBytes) GT 4) {
@@ -520,14 +512,12 @@
                         include "/poller/parse_rua.cfm";
                     }
 
-                    // Only dispose after confirmed DB write
                     disposeMessage(acct.username, mailbox, msgUID);
                     totalNew++;
 
                 } catch(any msgErr) {
                     logLine("  ERROR uid=#msgUID#: #msgErr.message# | #msgErr.detail#", "ERROR");
                     totalError++;
-                    // No disposeMessage on error - leave the message intact
                 }
             }
 
