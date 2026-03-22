@@ -13,8 +13,7 @@
 
       Access: admin session required (same as all other admin pages).
 --->
-<cfinclude template="/includes/auth_check.cfm">
-<cfinclude template="/includes/functions.cfm">
+<cfinclude template="/includes/auth.cfm">
 
 <cfscript>
     param name="url.offset"    default="0"  type="numeric";
@@ -25,7 +24,7 @@
     offset    = max(0, url.offset);
 
     // -----------------------------------------------------------------------
-    // getNodeText - identical to parse_rua.cfm; inline here so this page
+    // getNodeText — identical to parse_rua.cfm; inline here so this page
     // is self-contained and won't be affected by future changes to the poller.
     // -----------------------------------------------------------------------
     function getNodeText(required any xmlNode, required string path, string defaultVal="") {
@@ -44,8 +43,8 @@
     // -----------------------------------------------------------------------
     // Count total reports that still need backfilling.
     // A report "needs backfilling" if it has raw_reports content but has
-    // no rows in rptrecord.  We re-count on every batch so the display
-    // accurately reflects what was already completed in prior batches.
+    // no rows in rptrecord.  We re-count on every batch load so the display
+    // accurately reflects what prior batches already completed.
     // -----------------------------------------------------------------------
     qTotalNeeded = queryExecute(
         "SELECT COUNT(*) AS cnt
@@ -61,7 +60,7 @@
     totalNeeded = qTotalNeeded.cnt;
 
     // -----------------------------------------------------------------------
-    // Fetch this batch of reports to process.
+    // Fetch this batch.
     // -----------------------------------------------------------------------
     qBatch = queryExecute(
         "SELECT r.serial, r.domain, r.org, r.raw_reports
@@ -100,10 +99,9 @@
             rpt = xmlParse(xmlStr);
             fb  = rpt.feedback;
 
-            records     = fb.xmlChildren;
             recInserted = 0;
 
-            for (child in records) {
+            for (child in fb.xmlChildren) {
                 // lCase() required: Lucee returns XmlName in uppercase
                 if (lCase(child.XmlName) NEQ "record") continue;
 
@@ -138,13 +136,13 @@
                 if (len(spfResult))     { optCols &= ", spfresult";  optVals &= ", ?"; arrayAppend(optParams, { value: left(spfResult,20),      cfsqltype: "cf_sql_varchar" }); }
 
                 baseParams = [
-                    { value: row.serial,               cfsqltype: "cf_sql_integer" },
-                    { value: sourceIP,                 cfsqltype: "cf_sql_varchar" },
-                    { value: rcount,                   cfsqltype: "cf_sql_integer" },
-                    { value: left(disposition,20),     cfsqltype: "cf_sql_varchar" },
-                    { value: left(spfAlign,10),        cfsqltype: "cf_sql_varchar" },
-                    { value: left(dkimAlign,10),       cfsqltype: "cf_sql_varchar" },
-                    { value: left(hFrom,253),          cfsqltype: "cf_sql_varchar" }
+                    { value: row.serial,           cfsqltype: "cf_sql_integer" },
+                    { value: sourceIP,             cfsqltype: "cf_sql_varchar" },
+                    { value: rcount,               cfsqltype: "cf_sql_integer" },
+                    { value: left(disposition,20), cfsqltype: "cf_sql_varchar" },
+                    { value: left(spfAlign,10),    cfsqltype: "cf_sql_varchar" },
+                    { value: left(dkimAlign,10),   cfsqltype: "cf_sql_varchar" },
+                    { value: left(hFrom,253),      cfsqltype: "cf_sql_varchar" }
                 ];
 
                 queryExecute(
@@ -176,130 +174,130 @@
         }
     }
 
-    remaining   = totalNeeded - batchCount; // what's still left after this batch
-    nextOffset  = offset + batchSize;
-    isDone      = (batchCount EQ 0);
+    remaining  = totalNeeded - batchCount;
+    nextOffset = offset + batchSize;
+    isDone     = (batchCount EQ 0);
+
+    variables.pageTitle = "Backfill rptrecord";
+    variables.activeNav = "";
 </cfscript>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Backfill rptrecord — DMARC Admin</title>
-    <cfinclude template="/includes/head_css.cfm">
-    <style>
-        .bf-card   { background: rgb(22,27,34); border: 1px solid rgb(48,54,61); border-radius: 8px; padding: 1.5rem; max-width: 860px; margin: 1.5rem auto; }
-        .bf-title  { font-size: 1.1rem; font-weight: 600; margin-bottom: .25rem; }
-        .bf-sub    { font-size: .82rem; color: rgb(110,118,129); margin-bottom: 1.2rem; }
-        .stat-row  { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.2rem; }
-        .stat      { flex: 1; min-width: 120px; background: rgb(13,17,23); border: 1px solid rgb(48,54,61); border-radius: 6px; padding: .75rem 1rem; text-align: center; }
-        .stat-n    { font-size: 1.6rem; font-weight: 700; line-height: 1.1; }
-        .stat-l    { font-size: .72rem; color: rgb(110,118,129); text-transform: uppercase; letter-spacing: .06em; margin-top: .2rem; }
-        .ok        { color: rgb(63,185,80); }
-        .warn      { color: rgb(210,153,34); }
-        .err       { color: rgb(248,81,73); }
-        .neu       { color: rgb(139,148,158); }
-        .btn       { display: inline-block; padding: .5rem 1.2rem; border-radius: 6px; font-size: .9rem; font-weight: 600; text-decoration: none; cursor: pointer; border: none; }
-        .btn-go    { background: rgb(35,134,54); color: #fff; margin-right: .5rem; }
-        .btn-go:hover { background: rgb(46,160,67); }
-        .btn-dash  { background: transparent; border: 1px solid rgb(48,54,61); color: rgb(139,148,158); }
-        .btn-dash:hover { border-color: rgb(110,118,129); color: rgb(230,237,243); }
-        .done-msg  { color: rgb(63,185,80); font-size: 1rem; font-weight: 600; padding: .75rem 0; }
-        .fail-tbl  { width: 100%; border-collapse: collapse; font-size: .8rem; margin-top: .75rem; }
-        .fail-tbl th { text-align: left; color: rgb(110,118,129); padding: .3rem .5rem; border-bottom: 1px solid rgb(48,54,61); font-weight: 500; }
-        .fail-tbl td { padding: .3rem .5rem; border-bottom: 1px solid rgb(33,38,45); color: rgb(230,237,243); font-family: monospace; vertical-align: top; }
-        .fail-tbl td:last-child { color: rgb(248,81,73); word-break: break-word; }
-        .section-hd { font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: rgb(110,118,129); margin: 1rem 0 .4rem; }
-        .bs-form   { display: inline-flex; align-items: center; gap: .5rem; margin-left: 1rem; font-size: .82rem; color: rgb(110,118,129); }
-        .bs-form input { width: 60px; background: rgb(13,17,23); border: 1px solid rgb(48,54,61); color: rgb(230,237,243); border-radius: 4px; padding: .25rem .5rem; font-size: .82rem; }
-    </style>
-</head>
-<body>
-<cfinclude template="/includes/nav.cfm">
 
-<div class="bf-card">
-    <div class="bf-title">Backfill rptrecord rows</div>
-    <div class="bf-sub">
-        Repairs reports affected by the XmlName case bug — every report inserted before the fix
-        has a header row but 0 record rows. This tool re-parses <code>raw_reports</code> and
-        inserts the missing <code>rptrecord</code> rows. Safe to re-run; already-complete reports
-        are skipped automatically.
-    </div>
+<cfinclude template="/includes/header.cfm">
 
-    <cfif isDone>
+<style>
+    .bf-intro  { font-size: .85rem; color: var(--text-secondary); margin-bottom: 1.25rem; max-width: 720px; }
+    .stat-row  { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.25rem; }
+    .stat-tile { flex: 1; min-width: 120px; }
+    .done-msg  { color: var(--accent-green); font-size: 1rem; font-weight: 600; padding: .5rem 0 1rem; }
+    .fail-tbl  { width: 100%; border-collapse: collapse; font-size: .8rem; margin-top: .5rem; }
+    .fail-tbl th { text-align: left; color: var(--text-muted); padding: .35rem .5rem; border-bottom: 1px solid var(--border-color); font-weight: 500; font-family: var(--font-mono); font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; }
+    .fail-tbl td { padding: .35rem .5rem; border-bottom: 1px solid var(--border-color); color: var(--text-primary); font-family: var(--font-mono); font-size: .78rem; vertical-align: top; word-break: break-word; }
+    .fail-tbl td.err-msg { color: var(--accent-red); }
+    .section-hd { font-size: .7rem; text-transform: uppercase; letter-spacing: .08em; color: var(--text-muted); margin: 1rem 0 .4rem; font-family: var(--font-mono); }
+    .color-ok   { color: var(--accent-green) !important; }
+    .color-err  { color: var(--accent-red) !important; }
+    .color-warn { color: var(--accent-yellow) !important; }
+</style>
 
-        <div class="done-msg">&#10003; Nothing left to backfill — all reports with raw XML have record rows.</div>
-        <div style="margin-top:1rem;">
-            <a href="/admin/dashboard.cfm" class="btn btn-dash">&#8592; Dashboard</a>
-        </div>
+<div class="card">
+    <div class="card-header"><i class="bi bi-database-fill-gear me-2"></i>Backfill rptrecord rows</div>
+    <div class="card-body">
 
-    <cfelse>
+        <p class="bf-intro">
+            Repairs reports affected by the <code>XmlName</code> case bug — every report
+            inserted before the fix has a header row but 0 record rows.
+            Reads <code>raw_reports</code> XML from each affected row and inserts the missing
+            <code>rptrecord</code> entries. Safe to re-run; reports that already have records
+            are skipped automatically.
+        </p>
 
-        <!--- Stats for this batch --->
-        <div class="stat-row">
-            <div class="stat">
-                <div class="stat-n neu"><cfoutput>#numberFormat(totalNeeded)#</cfoutput></div>
-                <div class="stat-l">Needed (start of batch)</div>
+        <cfif isDone>
+
+            <div class="done-msg"><i class="bi bi-check-circle-fill me-2"></i>Nothing left to backfill — all reports with raw XML have record rows.</div>
+            <a href="/admin/dashboard.cfm" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>Dashboard</a>
+
+        <cfelse>
+
+            <div class="stat-row">
+                <div class="stat-tile">
+                    <div class="stat-label">Needed at start</div>
+                    <div class="stat-value mono"><cfoutput>#numberFormat(totalNeeded)#</cfoutput></div>
+                </div>
+                <div class="stat-tile">
+                    <div class="stat-label">This batch</div>
+                    <div class="stat-value mono"><cfoutput>#batchCount#</cfoutput></div>
+                </div>
+                <div class="stat-tile">
+                    <div class="stat-label">Backfilled OK</div>
+                    <div class="stat-value mono color-ok"><cfoutput>#cntOk#</cfoutput></div>
+                </div>
+                <div class="stat-tile">
+                    <div class="stat-label">Parse errors</div>
+                    <div class="stat-value mono <cfoutput>#cntFail GT 0 ? 'color-err' : ''#</cfoutput>"><cfoutput>#cntFail#</cfoutput></div>
+                </div>
+                <div class="stat-tile">
+                    <div class="stat-label">Still remaining</div>
+                    <div class="stat-value mono <cfoutput>#remaining GT 0 ? 'color-warn' : 'color-ok'#</cfoutput>"><cfoutput>#numberFormat(remaining)#</cfoutput></div>
+                </div>
             </div>
-            <div class="stat">
-                <div class="stat-n neu"><cfoutput>#batchCount#</cfoutput></div>
-                <div class="stat-l">Processed this batch</div>
-            </div>
-            <div class="stat">
-                <div class="stat-n ok"><cfoutput>#cntOk#</cfoutput></div>
-                <div class="stat-l">Backfilled OK</div>
-            </div>
-            <div class="stat">
-                <div class="stat-n err"><cfoutput>#cntFail#</cfoutput></div>
-                <div class="stat-l">Parse errors</div>
-            </div>
-            <div class="stat">
-                <div class="stat-n <cfoutput>#remaining GT 0 ? 'warn' : 'ok'#</cfoutput>"><cfoutput>#numberFormat(remaining)#</cfoutput></div>
-                <div class="stat-l">Still remaining</div>
-            </div>
-        </div>
 
-        <!--- Failures --->
-        <cfif arrayLen(failDetails)>
-            <div class="section-hd">Parse failures this batch (raw_reports XML was unparseable — these rows will be skipped on future runs)</div>
-            <table class="fail-tbl">
-                <thead><tr><th>ID</th><th>Org</th><th>Domain</th><th>Error</th></tr></thead>
-                <tbody>
-                <cfloop array="#failDetails#" item="f">
-                    <tr>
-                        <td><cfoutput>#f.serial#</cfoutput></td>
-                        <td><cfoutput>#htmlEditFormat(f.org)#</cfoutput></td>
-                        <td><cfoutput>#htmlEditFormat(f.domain)#</cfoutput></td>
-                        <td><cfoutput>#htmlEditFormat(f.error)#</cfoutput></td>
-                    </tr>
-                </cfloop>
-                </tbody>
-            </table>
-            <p style="font-size:.78rem;color:rgb(110,118,129);margin-top:.5rem;">
-                Parse failures are not retried automatically. If you need those reports you will
-                need to re-ingest from the original email attachments.
-            </p>
+            <cfif arrayLen(failDetails)>
+                <div class="section-hd">Parse failures this batch</div>
+                <p style="font-size:.8rem;color:var(--text-muted);margin-bottom:.5rem;">
+                    These reports had unparseable XML in <code>raw_reports</code>. They will be skipped
+                    permanently on future runs since they'll never acquire record rows.
+                    To recover them you'd need to re-ingest from the original email attachments.
+                </p>
+                <table class="fail-tbl">
+                    <thead><tr><th>ID</th><th>Org</th><th>Domain</th><th>Error</th></tr></thead>
+                    <tbody>
+                    <cfloop array="#failDetails#" item="f">
+                        <cfoutput>
+                        <tr>
+                            <td>#f.serial#</td>
+                            <td>#htmlEditFormat(f.org)#</td>
+                            <td>#htmlEditFormat(f.domain)#</td>
+                            <td class="err-msg">#htmlEditFormat(f.error)#</td>
+                        </tr>
+                        </cfoutput>
+                    </cfloop>
+                    </tbody>
+                </table>
+            </cfif>
+
+            <div style="margin-top:1.25rem;display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;">
+                <cfif remaining GT 0>
+                    <cfoutput>
+                    <a href="/admin/backfill_records.cfm?offset=#nextOffset#&batchSize=#batchSize#"
+                       class="btn btn-success btn-sm">
+                        Continue <i class="bi bi-arrow-right ms-1"></i>
+                        (#numberFormat(remaining)# remaining)
+                    </a>
+                    </cfoutput>
+                <cfelse>
+                    <div class="done-msg"><i class="bi bi-check-circle-fill me-2"></i>Backfill complete.</div>
+                </cfif>
+
+                <a href="/admin/dashboard.cfm" class="btn btn-outline-secondary btn-sm">
+                    <i class="bi bi-arrow-left me-1"></i>Dashboard
+                </a>
+
+                <form method="get" action="/admin/backfill_records.cfm"
+                      style="display:inline-flex;align-items:center;gap:.4rem;margin-left:.5rem;">
+                    <input type="hidden" name="offset" value="0">
+                    <label style="font-size:.8rem;color:var(--text-muted);margin:0;">Batch:</label>
+                    <input type="number" name="batchSize"
+                           value="<cfoutput>#batchSize#</cfoutput>"
+                           min="1" max="200"
+                           class="form-control form-control-sm"
+                           style="width:70px;">
+                    <button type="submit" class="btn btn-outline-secondary btn-sm">Restart</button>
+                </form>
+            </div>
+
         </cfif>
 
-        <!--- Continue / done --->
-        <div style="margin-top:1.2rem;display:flex;align-items:center;flex-wrap:wrap;gap:.5rem;">
-            <cfif remaining GT 0>
-                <a href="/admin/backfill_records.cfm?offset=<cfoutput>#nextOffset#</cfoutput>&batchSize=<cfoutput>#batchSize#</cfoutput>"
-                   class="btn btn-go">Continue &#8594; (<cfoutput>#numberFormat(remaining)#</cfoutput> remaining)</a>
-            <cfelse>
-                <div class="done-msg">&#10003; Backfill complete — no more reports to process.</div>
-            </cfif>
-            <a href="/admin/dashboard.cfm" class="btn btn-dash">&#8592; Dashboard</a>
-            <form method="get" action="/admin/backfill_records.cfm" style="display:inline;">
-                <input type="hidden" name="offset" value="0">
-                <span class="bs-form">
-                    Batch size: <input type="number" name="batchSize" value="<cfoutput>#batchSize#</cfoutput>" min="1" max="200">
-                    <button type="submit" class="btn btn-dash" style="padding:.25rem .7rem;font-size:.8rem;">Restart</button>
-                </span>
-            </form>
-        </div>
-
-    </cfif>
+    </div>
 </div>
 
-</body>
-</html>
+<cfinclude template="/includes/footer.cfm">
