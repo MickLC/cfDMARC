@@ -1,6 +1,6 @@
 <!--- admin/backfill_records.cfm
       One-time tool to backfill rptrecord rows for all report rows that
-      have raw_xml content but 0 associated rptrecord rows.
+      have raw_reports XML but 0 associated rptrecord rows.
 
       This repairs the historical dataset affected by the XmlName case bug:
       Lucee returns XmlName in uppercase, so "child.XmlName NEQ 'record'"
@@ -8,7 +8,8 @@
       "inserted 0 record row(s)" for every report since the poller launched.
 
       Safe to re-run: skips any report that already has rptrecord rows.
-      Processes in batches to avoid request timeouts on large backlogs.
+      Reports with no <record> elements (e.g. Microsoft metadata-only
+      reports) will count as processed but insert 0 rows — this is correct.
       Keep clicking "Continue" until it reports nothing left to process.
 
       Access: admin session required (same as all other admin pages).
@@ -42,15 +43,21 @@
 
     // -----------------------------------------------------------------------
     // Count total reports that still need backfilling.
-    // A report "needs backfilling" if it has raw_xml content but has no rows
-    // in rptrecord. We re-count on every batch load so the display accurately
-    // reflects what prior batches already completed.
+    // A report "needs backfilling" if it has raw_reports content but has no
+    // rows in rptrecord. We re-count on every batch load so the display
+    // accurately reflects what prior batches already completed.
+    //
+    // Note: reports with no <record> elements (Microsoft metadata-only
+    // reports) will never have rptrecord rows and will keep appearing here.
+    // They are processed correctly — 0 rows inserted is correct for them —
+    // but they'll always pass the NOT EXISTS check. We accept that; they
+    // are counted in cntOk, not cntFail.
     // -----------------------------------------------------------------------
     qTotalNeeded = queryExecute(
         "SELECT COUNT(*) AS cnt
          FROM   report r
-         WHERE  r.raw_xml IS NOT NULL
-           AND  r.raw_xml <> ''
+         WHERE  r.raw_reports IS NOT NULL
+           AND  r.raw_reports <> ''
            AND  NOT EXISTS (
                     SELECT 1 FROM rptrecord rr WHERE rr.report_id = r.id
                 )",
@@ -63,10 +70,10 @@
     // Fetch this batch.
     // -----------------------------------------------------------------------
     qBatch = queryExecute(
-        "SELECT r.id, r.domain, r.org, r.raw_xml
+        "SELECT r.id, r.domain, r.org, r.raw_reports
          FROM   report r
-         WHERE  r.raw_xml IS NOT NULL
-           AND  r.raw_xml <> ''
+         WHERE  r.raw_reports IS NOT NULL
+           AND  r.raw_reports <> ''
            AND  NOT EXISTS (
                     SELECT 1 FROM rptrecord rr WHERE rr.report_id = r.id
                 )
@@ -91,7 +98,7 @@
 
         try {
             // Strip UTF-8 BOM if present (same fix as parse_rua.cfm)
-            xmlStr = row.raw_xml;
+            xmlStr = row.raw_reports;
             if (len(xmlStr) AND asc(left(xmlStr, 1)) EQ 65279) {
                 xmlStr = mid(xmlStr, 2, len(xmlStr) - 1);
             }
@@ -204,16 +211,18 @@
     <div class="card-body">
 
         <p class="bf-intro">
-            Repairs reports affected by the <code>XmlName</code> case bug — every report
+            Repairs reports affected by the <code>XmlName</code> case bug &mdash; every report
             inserted before the fix has a header row but 0 record rows.
-            Reads <code>raw_xml</code> from each affected row and inserts the missing
+            Reads <code>raw_reports</code> XML from each affected row and inserts the missing
             <code>rptrecord</code> entries. Safe to re-run; reports that already have records
-            are skipped automatically.
+            are skipped automatically. Reports with no <code>&lt;record&gt;</code> elements
+            (e.g. Microsoft metadata-only reports) count as processed with 0 rows inserted
+            &mdash; this is correct behaviour.
         </p>
 
         <cfif isDone>
 
-            <div class="done-msg"><i class="bi bi-check-circle-fill me-2"></i>Nothing left to backfill — all reports with raw XML have record rows.</div>
+            <div class="done-msg"><i class="bi bi-check-circle-fill me-2"></i>Nothing left to backfill &mdash; all reports with raw XML have been processed.</div>
             <a href="/admin/dashboard.cfm" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>Dashboard</a>
 
         <cfelse>
@@ -228,7 +237,7 @@
                     <div class="stat-value mono"><cfoutput>#batchCount#</cfoutput></div>
                 </div>
                 <div class="stat-tile">
-                    <div class="stat-label">Backfilled OK</div>
+                    <div class="stat-label">Processed OK</div>
                     <div class="stat-value mono color-ok"><cfoutput>#cntOk#</cfoutput></div>
                 </div>
                 <div class="stat-tile">
@@ -244,8 +253,8 @@
             <cfif arrayLen(failDetails)>
                 <div class="section-hd">Parse failures this batch</div>
                 <p style="font-size:.8rem;color:var(--text-muted);margin-bottom:.5rem;">
-                    These reports had unparseable XML in <code>raw_xml</code>. They will be skipped
-                    permanently on future runs since they'll never acquire record rows.
+                    These reports had unparseable XML in <code>raw_reports</code>. They will keep
+                    appearing in the backfill queue since they'll never acquire record rows.
                     To recover them you'd need to re-ingest from the original email attachments.
                 </p>
                 <table class="fail-tbl">
