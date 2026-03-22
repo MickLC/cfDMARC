@@ -15,8 +15,9 @@
         3. Fetches metadata only (headers, no payload) for deduplication
         4. Skips already-seen messages cheaply - no full payload download
         5. Fetches full payload only for genuinely new messages
-        6. Includes parse_rua.cfm or parse_ruf.cfm exactly as the doveadm path does
-        7. Marks messages read and/or deletes them per poller settings
+        6. Sets msgBody (for RUF) or attachments (for RUA) from payload
+        7. Includes parse_rua.cfm or parse_ruf.cfm exactly as the doveadm path does
+        8. Marks messages read and/or deletes them per poller settings
 
       Gmail API base: https://gmail.googleapis.com/gmail/v1/users/me
 
@@ -43,6 +44,14 @@
         C) single-part with large attachment - payload.body.attachmentId,
            payload.body.data is absent or empty (Google DMARC reports use this)
       All three shapes are handled in the full-fetch branch.
+
+      RUF vs RUA handling:
+        RUA: ZIP/GZ/XML attachment bytes are extracted into `attachments` array.
+             Messages with no extractable attachment are skipped.
+        RUF: No attachment exists. The report is the message body itself
+             (multipart/report with message/feedback-report part).
+             msgBody is assembled from the payload parts text content.
+             parse_ruf.cfm receives msgBody and parses the ARF headers from it.
 --->
 <cfscript>
 
@@ -193,6 +202,17 @@
     }
 
     // -----------------------------------------------------------------------
+    // b64urlDecodeToString(encoded)
+    //
+    // Like b64urlDecode() but returns a UTF-8 String rather than byte[].
+    // Used for reassembling text MIME parts for RUF body parsing.
+    // -----------------------------------------------------------------------
+    function b64urlDecodeToString(required string encoded) {
+        var bytes = b64urlDecode(arguments.encoded);
+        return createObject("java", "java.lang.String").init(bytes, "UTF-8");
+    }
+
+    // -----------------------------------------------------------------------
     // extractHeaderValue(headers, name)
     //
     // Gmail API returns headers as array of {name, value} structs.
@@ -287,6 +307,74 @@
         }
 
         return found;
+    }
+
+    // -----------------------------------------------------------------------
+    // extractGmailRufBody(payload)
+    //
+    // Reassembles a text representation of a RUF (multipart/report) message
+    // from a Gmail format=full payload struct, suitable for parse_ruf.cfm.
+    //
+    // Strategy: walk the parts[] tree, decode any text/* part (text/plain,
+    // text/html, message/feedback-report, message/rfc822) and concatenate
+    // them with MIME-style part separators so that parse_ruf.cfm's regex
+    // searches for "Content-Type: message/feedback-report" and
+    // "Content-Type: message/rfc822" still work.
+    //
+    // The Gmail API encodes part bodies as base64url. We decode each part
+    // to UTF-8 string, prefix it with its Content-Type header line, then
+    // join the parts. The result is not a valid MIME document but contains
+    // all the ARF fields parse_ruf.cfm needs.
+    //
+    // Returns assembled body string, or empty string if no text parts found.
+    // -----------------------------------------------------------------------
+    function extractGmailRufBody(required struct payload) {
+        var sb = createObject("java", "java.lang.StringBuilder").init();
+
+        function walkParts(required array parts) {
+            for (var part in arguments.parts) {
+                var mimeType = trim(part.mimeType ?: "");
+
+                // Recurse into multipart containers, emitting a Content-Type
+                // header line first so parse_ruf.cfm can find the part boundary
+                if (reFindNoCase("^multipart/", mimeType)) {
+                    if (structKeyExists(part, "parts") AND isArray(part.parts) AND arrayLen(part.parts))
+                        walkParts(part.parts);
+                    continue;
+                }
+
+                // Emit a pseudo-header for this part so parse_ruf.cfm's
+                // reFindNoCase("Content-Type: message/feedback-report", ...) matches
+                sb.append("Content-Type: " & mimeType & chr(10));
+                sb.append(chr(10));  // blank line = end of part headers
+
+                // Decode body data if present
+                var partData = "";
+                if (structKeyExists(part, "body") AND isStruct(part.body)
+                        AND structKeyExists(part.body, "data") AND len(part.body.data)) {
+                    try {
+                        partData = b64urlDecodeToString(part.body.data);
+                    } catch(any e) {
+                        partData = "";
+                    }
+                }
+                sb.append(partData);
+                sb.append(chr(10) & chr(10));
+            }
+        }
+
+        // Top-level: if payload itself has parts, walk them;
+        // if it has a body (single-part), decode that.
+        if (structKeyExists(arguments.payload, "parts") AND isArray(arguments.payload.parts) AND arrayLen(arguments.payload.parts)) {
+            walkParts(arguments.payload.parts);
+        } else if (structKeyExists(arguments.payload, "body") AND isStruct(arguments.payload.body)
+                AND structKeyExists(arguments.payload.body, "data") AND len(arguments.payload.body.data)) {
+            try {
+                sb.append(b64urlDecodeToString(arguments.payload.body.data));
+            } catch(any e) {}
+        }
+
+        return sb.toString();
     }
 
     // -----------------------------------------------------------------------
@@ -474,68 +562,88 @@
                             continue;
                         }
 
-                        // Collect attachment bytes.
-                        // No var declarations - page scope, not function scope.
-                        //
-                        // Shape A: multipart - walk parts[] tree
-                        // Shape B: single-part with inline body.data
-                        // Shape C: single-part with body.attachmentId (no body.data)
-                        //          This is what Google DMARC reports use.
-                        attachments  = [];
-                        rawBytesList = [];
-                        topMime      = lCase(gmailPayload.mimeType ?: "");
-                        topFile      = lCase(gmailPayload.filename ?: "");
-
-                        if (structKeyExists(gmailPayload, "parts") AND isArray(gmailPayload.parts) AND arrayLen(gmailPayload.parts)) {
-                            // Shape A: multipart
-                            rawBytesList = findAttachmentParts(gmailPayload.parts, gmailMsgId, gmailToken);
-                            for (rb in rawBytesList) {
-                                arrayAppend(attachments, { name: "report", bytes: rb });
-                            }
-
-                        } else if (structKeyExists(gmailPayload, "body") AND isStruct(gmailPayload.body)) {
-                            // Shape B or C: single-part
-                            isDmarcTopLevel = false;
-                            if (reFindNoCase("application/(zip|gzip|x-zip|x-gzip|octet-stream|xml)", topMime)) isDmarcTopLevel = true;
-                            if (reFindNoCase("\.(zip|gz|xml)$", topFile)) isDmarcTopLevel = true;
-
-                            if (isDmarcTopLevel) {
-                                topBytes = javaCast("null", "");
-                                try {
-                                    topBytes = fetchAttachmentBytes(gmailPayload.body, gmailMsgId, gmailToken);
-                                } catch(any topErr) {
-                                    logLine("  Gmail: top-level attachment fetch error msg=#gmailMsgId#: #topErr.message#", "WARN");
-                                }
-                                if (NOT isNull(topBytes) AND arrayLen(topBytes) GT 4)
-                                    arrayAppend(attachments, { name: "report", bytes: topBytes });
-                            } else {
-                                logLine("  Gmail: msg=#gmailMsgId# single-part non-DMARC mime type: #topMime#", "WARN");
-                            }
-
-                        } else {
-                            logLine("  Gmail: msg=#gmailMsgId# unrecognised payload shape - mimeType=#topMime#", "WARN");
-                        }
-
-                        if (NOT arrayLen(attachments)) {
-                            logLine("  Gmail: no attachment bytes for msg=#gmailMsgId# sub=#left(msgSubject,60)#", "WARN");
-                            gmailSkip++;
-                            totalSkip++;
-                            markGmailMessage(gmailToken, gmailMsgId,
-                                application.poller.markAsRead,
-                                structKeyExists(application.poller, "deleteAfter") AND application.poller.deleteAfter);
-                            continue;
-                        }
-
-                        // Detect RUF vs RUA and parse
+                        // Detect RUF vs RUA before deciding how to extract content.
+                        // RUF = multipart/report with report-type=feedback-report.
+                        // RUF messages have no ZIP/GZ attachment; their content IS
+                        // the message body (ARF feedback-report MIME part).
                         isRUF = reFindNoCase("multipart/report", contentType)
                                 AND reFindNoCase("report-type=feedback-report", contentType);
 
                         if (isRUF) {
+
+                            // Reassemble MIME body text from payload parts for parse_ruf.cfm
+                            msgBody = extractGmailRufBody(gmailPayload);
+
+                            if (NOT len(trim(msgBody))) {
+                                logLine("  Gmail: RUF msg=#gmailMsgId# has no decodable body - skipping", "WARN");
+                                gmailSkip++;
+                                totalSkip++;
+                                markGmailMessage(gmailToken, gmailMsgId,
+                                    application.poller.markAsRead,
+                                    structKeyExists(application.poller, "deleteAfter") AND application.poller.deleteAfter);
+                                continue;
+                            }
+
                             logLine("  Gmail: msg=#gmailMsgId# -> RUF");
                             include "/poller/parse_ruf.cfm";
+
                         } else {
+
+                            // RUA: collect attachment bytes from the payload tree.
+                            // No var declarations - page scope, not function scope.
+                            //
+                            // Shape A: multipart - walk parts[] tree
+                            // Shape B: single-part with inline body.data
+                            // Shape C: single-part with body.attachmentId (no body.data)
+                            //          This is what Google DMARC reports use.
+                            attachments  = [];
+                            rawBytesList = [];
+                            topMime      = lCase(gmailPayload.mimeType ?: "");
+                            topFile      = lCase(gmailPayload.filename ?: "");
+
+                            if (structKeyExists(gmailPayload, "parts") AND isArray(gmailPayload.parts) AND arrayLen(gmailPayload.parts)) {
+                                // Shape A: multipart
+                                rawBytesList = findAttachmentParts(gmailPayload.parts, gmailMsgId, gmailToken);
+                                for (rb in rawBytesList) {
+                                    arrayAppend(attachments, { name: "report", bytes: rb });
+                                }
+
+                            } else if (structKeyExists(gmailPayload, "body") AND isStruct(gmailPayload.body)) {
+                                // Shape B or C: single-part
+                                isDmarcTopLevel = false;
+                                if (reFindNoCase("application/(zip|gzip|x-zip|x-gzip|octet-stream|xml)", topMime)) isDmarcTopLevel = true;
+                                if (reFindNoCase("\.(zip|gz|xml)$", topFile)) isDmarcTopLevel = true;
+
+                                if (isDmarcTopLevel) {
+                                    topBytes = javaCast("null", "");
+                                    try {
+                                        topBytes = fetchAttachmentBytes(gmailPayload.body, gmailMsgId, gmailToken);
+                                    } catch(any topErr) {
+                                        logLine("  Gmail: top-level attachment fetch error msg=#gmailMsgId#: #topErr.message#", "WARN");
+                                    }
+                                    if (NOT isNull(topBytes) AND arrayLen(topBytes) GT 4)
+                                        arrayAppend(attachments, { name: "report", bytes: topBytes });
+                                } else {
+                                    logLine("  Gmail: msg=#gmailMsgId# single-part non-DMARC mime type: #topMime#", "WARN");
+                                }
+
+                            } else {
+                                logLine("  Gmail: msg=#gmailMsgId# unrecognised payload shape - mimeType=#topMime#", "WARN");
+                            }
+
+                            if (NOT arrayLen(attachments)) {
+                                logLine("  Gmail: RUA msg=#gmailMsgId# no attachment bytes found sub=#left(msgSubject,60)# - skipping", "WARN");
+                                gmailSkip++;
+                                totalSkip++;
+                                markGmailMessage(gmailToken, gmailMsgId,
+                                    application.poller.markAsRead,
+                                    structKeyExists(application.poller, "deleteAfter") AND application.poller.deleteAfter);
+                                continue;
+                            }
+
                             logLine("  Gmail: msg=#gmailMsgId# -> RUA");
                             include "/poller/parse_rua.cfm";
+
                         }
 
                         // Dispose only after confirmed parse

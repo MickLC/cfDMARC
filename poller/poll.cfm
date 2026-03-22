@@ -20,6 +20,7 @@
           - doveadm flags add     : mark \Seen after processing
           - extractDmarcAttachment: parse raw MIME body, locate ZIP/GZ/XML part,
                                     base64-decode only the attachment payload
+                                    (RUA only; RUF messages use msgBody directly)
           - extractXmlFromBytes   : decompress ZIP/GZ in parse_rua.cfm
 
         OAuth2 accounts (Gmail):
@@ -32,6 +33,13 @@
 
       Note: doveadm path only works for local Dovecot accounts on this server.
       Gmail accounts use fetch_gmail.cfm via the Gmail REST API.
+
+      Variables consumed by parse_ruf.cfm / parse_rua.cfm (set below):
+        msgBody      — raw MIME body text (RUF); not used by parse_rua.cfm
+        msgSubject   — subject line
+        cleanMsgId   — deduplicated Message-ID string
+        attachments  — array of { name, bytes } structs (RUA); may be empty for RUF
+        acct         — current imap_accounts row
 --->
 <cfinclude template="/includes/functions.cfm">
 
@@ -159,6 +167,10 @@
     //
     // Uses splitOnLiteral() for boundary splitting; listToArray() mishandles
     // multi-character delimiters by treating each char as a separate token.
+    //
+    // NOTE: Not called for RUF messages. RUF reports are multipart/report
+    // emails; their content is in the message body, not in a ZIP/GZ attachment.
+    // parse_ruf.cfm receives msgBody (= fetched.body) directly.
     // -----------------------------------------------------------------------
     function extractDmarcAttachment(required string mimeBody, required string topHeaders) {
 
@@ -176,7 +188,7 @@
         }
 
         function getBoundary(required string ctValue) {
-            var m = reFind("(?i)boundary=[""']?([^""';\s,]+)[""']?", arguments.ctValue, 1, true);
+            var m = reFind("(?i)boundary=[\"']?([^\"';\s,]+)[\"']?", arguments.ctValue, 1, true);
             if (m.len[1] GT 0 AND arrayLen(m.len) GT 1)
                 return mid(arguments.ctValue, m.pos[2], m.len[2]);
             return "";
@@ -191,9 +203,9 @@
 
         function getFilename(required string cd, required string ct) {
             var combined = arguments.cd & " " & arguments.ct;
-            var m = reFind("(?i)filename=[""']?([^""';\r\n]+)[""']?", combined, 1, true);
+            var m = reFind("(?i)filename=[\"']?([^\"';\r\n]+)[\"']?", combined, 1, true);
             if (m.len[1] GT 0 AND arrayLen(m.len) GT 1)
-                return trim(reReplace(mid(combined, m.pos[2], m.len[2]), "[""']", "", "ALL"));
+                return trim(reReplace(mid(combined, m.pos[2], m.len[2]), "[\"']", "", "ALL"));
             return "";
         }
 
@@ -455,20 +467,10 @@
                     fetched      = fetchViaDoveadm(acct.username, mailbox, msgUID);
                     contentType  = fetched.contentType;
                     attachments  = [];
+                    msgBody      = fetched.body;  // needed by parse_ruf.cfm
                     msgMessageId = len(fetched.messageId) ? fetched.messageId : (len(quickMsgId) ? quickMsgId : createUUID());
 
-                    if (len(trim(fetched.body))) {
-                        try {
-                            rawBytes = extractDmarcAttachment(fetched.body, fetched.headers);
-                            if (NOT isNull(rawBytes) AND arrayLen(rawBytes) GT 4) {
-                                attachments = [{ name: "report", bytes: rawBytes }];
-                            } else {
-                                logLine("  uid=#msgUID# no attachment bytes extracted", "WARN");
-                            }
-                        } catch(any decErr) {
-                            logLine("  uid=#msgUID# extract error: #decErr.message#", "WARN");
-                        }
-                    } else {
+                    if (NOT len(trim(fetched.body))) {
                         // doveadm returned nothing - UID was deleted after search
                         totalSkip++;
                         continue;
@@ -493,9 +495,27 @@
                     if (NOT isRUF AND len(fetched.headers)) isRUF = reFindNoCase("feedback-report", fetched.headers);
 
                     if (isRUF) {
+                        // RUF: the ARF content is in the message body itself.
+                        // parse_ruf.cfm uses msgBody (= fetched.body) directly.
+                        // There is no ZIP/GZ attachment to extract.
                         logLine("  uid=#msgUID# -> RUF");
                         include "/poller/parse_ruf.cfm";
                     } else {
+                        // RUA: find the ZIP/GZ/XML attachment bytes.
+                        try {
+                            rawBytes = extractDmarcAttachment(fetched.body, fetched.headers);
+                            if (NOT isNull(rawBytes) AND arrayLen(rawBytes) GT 4) {
+                                attachments = [{ name: "report", bytes: rawBytes }];
+                            } else {
+                                logLine("  uid=#msgUID# RUA: no attachment bytes extracted - skipping", "WARN");
+                                totalSkip++;
+                                continue;
+                            }
+                        } catch(any decErr) {
+                            logLine("  uid=#msgUID# RUA extract error: #decErr.message# - skipping", "WARN");
+                            totalSkip++;
+                            continue;
+                        }
                         logLine("  uid=#msgUID# -> RUA");
                         include "/poller/parse_rua.cfm";
                     }

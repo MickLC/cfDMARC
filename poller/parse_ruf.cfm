@@ -2,17 +2,31 @@
       Parse one DMARC forensic/failure report (RUF).
       Included by poll.cfm inside the message-processing loop.
 
-      Expects the following variables set by poll.cfm:
-        msgBody      — decoded text body of the message
+      Expects the following variables set by the caller (poll.cfm / fetch_gmail.cfm):
+        msgBody      — raw MIME body text of the message:
+                         Dovecot path : fetched.body (from fetchViaDoveadm)
+                         Gmail path   : extracted by extractGmailRufBody()
+                       parse_ruf.cfm searches this text for Content-Type:
+                       message/feedback-report and message/rfc822 sections.
         msgSubject   — subject line
-        msgFrom      — envelope From address
         cleanMsgId   — deduplicated Message-ID string
-        attachments  — array of attachment structs (may be empty for RUF)
         acct         — current imap_accounts row
 
+      Note: `attachments` is NOT used by this file. RUF reports have no
+      ZIP/GZ attachment; all ARF content is in the message body.
+
       Inserts one row into the `failure` table.
+      Returns early (no INSERT) if msgBody is empty.
 --->
 <cfscript>
+
+    // Guard: if the caller has no body content there is nothing to parse.
+    // This handles the subset of RUF messages that consist only of headers
+    // (e.g. header-only forwards or malformed complaint messages).
+    if (NOT len(trim(msgBody))) {
+        logLine("  RUF: empty msgBody - nothing to parse, skipping", "WARN");
+        return;
+    }
 
     // Helper: extract a single header value from an RFC 2822 / ARF block
     function extractHeader(required string block, required string headerName, string defaultVal="") {
