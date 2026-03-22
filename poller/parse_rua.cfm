@@ -200,7 +200,9 @@
     recInserted = 0;
 
     for (child in records) {
-        if (child.XmlName NEQ "record") continue;
+        // XmlName is returned uppercase by Lucee's XML parser regardless of
+        // source case — use lCase() for a case-insensitive comparison.
+        if (lCase(child.XmlName) NEQ "record") continue;
 
         rec = child;
 
