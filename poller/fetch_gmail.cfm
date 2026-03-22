@@ -15,22 +15,20 @@
              plain-text forensic notification). msgBody assembled from payload
              parts via extractGmailRufBody().
 
-      RUF detection (isRUF) covers three formats observed in the wild:
-        1. Standard ARF: Content-Type multipart/report; report-type=feedback-report
-        2. Plain-text forensic notification: subject matches
-           "DMARC Forensic Report" or "DMARC Failure Report" (antispamcloud,
-           Validity/ReturnPath, etc.)
-        3. Auto-submitted with forensic-report-like subject
+      RUF detection (isRUF) covers formats observed in the wild:
+        1. Standard ARF Content-Type:
+             multipart/report; report-type=feedback-report
+             multipart/report; report-type="feedback-report"  (quoted value)
+        2. Plain-text forensic notification subject line:
+             "DMARC Forensic Report" or "DMARC Failure Report"
+        3. Auto-submitted + DMARC + Report in subject (edge cases)
 
       Lucee string-literal gotchas:
         - Do NOT embed literal " inside double-quoted CFML strings passed to
-          regex functions. Lucee's lexer treats it as the string terminator
-          even inside a character class [...]. Use chr(34) instead.
+          regex functions. Use chr(34) instead.
         - Do NOT use \s, \r, \n, \t in double-quoted CFML string literals.
-          Lucee's string parser consumes the backslash. Use chr() or explicit
-          character classes like [ \t] instead.
-        - \\s (double-backslash) in a CFML string literal becomes \s in the
-          string value, which the regex engine sees correctly as whitespace.
+          Use chr() or explicit character classes. \\s (double-backslash)
+          becomes \s in the string value and works correctly for the regex.
 --->
 <cfscript>
 
@@ -153,8 +151,6 @@
 
     // -----------------------------------------------------------------------
     // b64urlDecode(encoded)
-    //
-    // Whitespace stripping uses chr() to avoid \s mangling in Lucee.
     // -----------------------------------------------------------------------
     function b64urlDecode(required string encoded) {
         var std = arguments.encoded
@@ -163,7 +159,6 @@
         var pad = len(std) mod 4;
         if (pad EQ 2) std &= "==";
         else if (pad EQ 3) std &= "=";
-        // Strip whitespace using chr() - do NOT use \s in a string literal
         var clean = reReplace(std, "[ " & chr(9) & chr(13) & chr(10) & "]+", "", "ALL");
         return createObject("java", "java.util.Base64").getDecoder().decode(clean);
     }
@@ -185,6 +180,21 @@
                 return trim(h.value);
         }
         return "";
+    }
+
+    // -----------------------------------------------------------------------
+    // isRufContentType(ct)
+    //
+    // Returns true if ct indicates a standard ARF RUF message.
+    // Matches both quoted and unquoted report-type parameter values:
+    //   multipart/report; report-type=feedback-report
+    //   multipart/report; report-type="feedback-report"
+    //
+    // chr(34) injects a literal " without confusing the CFML lexer.
+    // -----------------------------------------------------------------------
+    function isRufContentType(required string ct) {
+        if (NOT reFindNoCase("multipart/report", arguments.ct)) return false;
+        return reFindNoCase("report-type=[" & chr(34) & "']?feedback-report", arguments.ct) GT 0;
     }
 
     // -----------------------------------------------------------------------
@@ -262,12 +272,8 @@
     // extractGmailRufBody(payload)
     //
     // Reassembles MIME body text from a Gmail format=full payload for
-    // parse_ruf.cfm. Handles three structures:
-    //   1. multipart - walks parts[] tree, decoding each part
-    //   2. single-part with body.data inline (e.g. text/plain forensic notify)
-    //   3. single-part with body.attachmentId (rare but possible)
-    // Each part is prefixed with its Content-Type line so parse_ruf.cfm's
-    // regex searches for "Content-Type: message/feedback-report" still work.
+    // parse_ruf.cfm. Emits Content-Type header lines so parse_ruf.cfm's
+    // regex searches for MIME part boundaries still work.
     // -----------------------------------------------------------------------
     function extractGmailRufBody(required struct payload) {
         var sb = createObject("java", "java.lang.StringBuilder").init();
@@ -282,7 +288,7 @@
                     continue;
                 }
 
-                // Emit Content-Type header so parse_ruf.cfm can locate parts
+                // Emit Content-Type header so parse_ruf.cfm's pattern searches work
                 sb.append("Content-Type: " & mimeType & chr(10));
                 sb.append(chr(10));
 
@@ -291,7 +297,6 @@
                     if (structKeyExists(part.body, "data") AND len(part.body.data)) {
                         try { partData = b64urlDecodeToString(part.body.data); } catch(any e) { partData = ""; }
                     } else if (structKeyExists(part.body, "attachmentId") AND len(part.body.attachmentId)) {
-                        // Rare: body text stored as attachment - fetch it
                         try {
                             var attResp = gmailApiGet(gmailToken,
                                 "messages/" & gmailMsgId & "/attachments/" & part.body.attachmentId);
@@ -306,7 +311,7 @@
         }
 
         if (structKeyExists(arguments.payload, "parts") AND isArray(arguments.payload.parts) AND arrayLen(arguments.payload.parts)) {
-            // Multipart message: emit top-level Content-Type then walk parts
+            // Multipart: emit top-level Content-Type then walk parts
             var topMimeType = trim(arguments.payload.mimeType ?: "");
             if (len(topMimeType)) {
                 sb.append("Content-Type: " & topMimeType & chr(10));
@@ -314,7 +319,7 @@
             }
             walkParts(arguments.payload.parts);
         } else if (structKeyExists(arguments.payload, "body") AND isStruct(arguments.payload.body)) {
-            // Single-part message (e.g. plain-text forensic notification)
+            // Single-part (e.g. text/plain forensic notification)
             var topMimeType = trim(arguments.payload.mimeType ?: "");
             if (len(topMimeType)) {
                 sb.append("Content-Type: " & topMimeType & chr(10));
@@ -348,7 +353,6 @@
                 }
             } else if (arguments.markRead) {
                 var modEndpoint = "https://gmail.googleapis.com/gmail/v1/users/me/messages/#arguments.gmailMsgId#/modify";
-                // Hardcoded JSON - do NOT use serializeJSON(), Lucee uppercases keys.
                 var modBody = '{"removeLabelIds":["UNREAD"]}';
                 cfhttp(url=modEndpoint, method="POST", result="modResp", timeout=15) {
                     cfhttpparam(type="header", name="Authorization",  value="Bearer #arguments.accessToken#");
@@ -461,9 +465,9 @@
                                                  "[<> " & chr(9) & chr(13) & chr(10) & "]+", "", "ALL")
                                      : cleanMsgId;
 
-                        msgSubject     = extractHeaderValue(gmailHeaders, "subject");
-                        contentType    = extractHeaderValue(gmailHeaders, "content-type");
-                        autoSubmitted  = extractHeaderValue(gmailHeaders, "auto-submitted");
+                        msgSubject    = extractHeaderValue(gmailHeaders, "subject");
+                        contentType   = extractHeaderValue(gmailHeaders, "content-type");
+                        autoSubmitted = extractHeaderValue(gmailHeaders, "auto-submitted");
 
                         qDupe = queryExecute(
                             "SELECT id FROM report WHERE message_id=? LIMIT 1",
@@ -484,31 +488,21 @@
                         // -------------------------------------------------------
                         // RUF detection - three signals, any one is sufficient:
                         //
-                        // 1. Standard ARF Content-Type:
-                        //    multipart/report; report-type=feedback-report
+                        // 1. Standard ARF Content-Type (quoted or unquoted value):
+                        //    multipart/report; report-type=["']?feedback-report
                         //
-                        // 2. Plain-text forensic notification subject
-                        //    (antispamcloud, Validity/ReturnPath, and others):
-                        //    Subject: DMARC Forensic Report for ...
-                        //    Subject: DMARC Failure Report for ...
-                        //    Subject: Re: DMARC Forensic/Failure Report ...
+                        // 2. Plain-text forensic notification subject line:
+                        //    "DMARC Forensic Report" / "DMARC Failure Report"
                         //
-                        // 3. Auto-submitted header present AND subject contains
-                        //    "DMARC" (catches edge cases from less common senders)
+                        // 3. Auto-Submitted header + DMARC + Report in subject
                         // -------------------------------------------------------
-                        isRUF = false;
+                        isRUF = isRufContentType(contentType);
 
-                        // Signal 1: standard ARF Content-Type
-                        if (reFindNoCase("multipart/report", contentType)
-                                AND reFindNoCase("report-type=feedback-report", contentType))
-                            isRUF = true;
-
-                        // Signal 2: forensic/failure report subject line
                         if (NOT isRUF AND reFindNoCase("DMARC (Forensic|Failure) Report", msgSubject))
                             isRUF = true;
 
-                        // Signal 3: auto-submitted + DMARC in subject
-                        if (NOT isRUF AND len(autoSubmitted) AND reFindNoCase("DMARC", msgSubject)
+                        if (NOT isRUF AND len(autoSubmitted)
+                                AND reFindNoCase("DMARC", msgSubject)
                                 AND reFindNoCase("Report", msgSubject))
                             isRUF = true;
 

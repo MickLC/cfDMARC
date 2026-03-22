@@ -49,6 +49,8 @@
         - Do NOT use \s, \r, \n, \t inside double-quoted CFML string literals.
           Lucee's string parser consumes the backslash, so the regex engine
           never sees the escape sequence. Use [ \t] or chr() alternatives.
+        - \\s (double-backslash) in a CFML string literal becomes \s in the
+          string value, which the regex engine sees correctly as whitespace.
 --->
 <cfinclude template="/includes/functions.cfm">
 
@@ -82,10 +84,6 @@
 
     // -----------------------------------------------------------------------
     // disposeMessage(username, mailbox, uid)
-    //
-    // Called after a message has been successfully handled (inserted or confirmed
-    // duplicate). Applies markAsRead and/or deleteAfter per settings.
-    // Never called on error paths so we never discard a message we failed to store.
     // -----------------------------------------------------------------------
     function disposeMessage(required string username, required string mailbox, required string uid) {
         if (application.poller.markAsRead) {
@@ -112,8 +110,6 @@
 
     // -----------------------------------------------------------------------
     // getUnseenUids(username, mailbox, maxCount)
-    //
-    // Uses doveadm search to return an array of UID strings for unseen messages.
     // -----------------------------------------------------------------------
     function getUnseenUids(required string username, required string mailbox, required numeric maxCount) {
         var searchOut = "";
@@ -153,19 +149,10 @@
 
     // -----------------------------------------------------------------------
     // extractDmarcAttachment(mimeBody, topHeaders)
-    //
-    // Locate and base64-decode the DMARC attachment bytes from a raw MIME body.
-    // NOT called for RUF messages (no attachment; body is the report).
-    //
-    // IMPORTANT: All regex patterns here avoid embedding literal " (double-quote)
-    // inside CFML double-quoted string literals - Lucee's lexer would treat the
-    // embedded " as the string closing delimiter, causing a compile error.
-    // Double-quotes are injected via chr(34) where needed. Similarly, \s/\r/\n
-    // are replaced with chr() or explicit character classes.
+    // NOT called for RUF messages.
     // -----------------------------------------------------------------------
     function extractDmarcAttachment(required string mimeBody, required string topHeaders) {
 
-        // Parse RFC 2822 header block into a lowercase-keyed struct.
         function parseHeaders(required string hdrs) {
             var result   = {};
             var unfolded = reReplace(arguments.hdrs, "(" & chr(13) & chr(10) & "|" & chr(10) & ")[ " & chr(9) & "]+", " ", "ALL");
@@ -179,15 +166,10 @@
             return result;
         }
 
-        // Extract boundary parameter value from a Content-Type header value.
-        // Pattern: boundary=value  or  boundary='value'  (single-quote delimited)
-        // Double-quotes avoided in character classes - use chr(34) if ever needed.
-        // \s replaced with [ \t] to survive Lucee string-literal parsing.
         function getBoundary(required string ctValue) {
             var pat = "(?i)boundary=([^'" & chr(34) & "; " & chr(9) & ",]+)";
             var m   = reFind(pat, arguments.ctValue, 1, true);
             if (m.len[1] GT 0 AND arrayLen(m.len) GT 1) {
-                // Strip surrounding single-quotes if present
                 var val = mid(arguments.ctValue, m.pos[2], m.len[2]);
                 return reReplace(val, "^'|'$", "", "ALL");
             }
@@ -201,23 +183,17 @@
             return false;
         }
 
-        // Extract filename from Content-Disposition and Content-Type header values.
-        // Avoids embedding " in character classes; uses chr(34) instead.
         function getFilename(required string cd, required string ct) {
             var combined = arguments.cd & " " & arguments.ct;
-            // Pattern: filename=value  where value may be single- or double-quoted
             var pat = "(?i)filename=([^" & chr(34) & "'; " & chr(9) & chr(13) & chr(10) & "]+)";
             var m   = reFind(pat, combined, 1, true);
             if (m.len[1] GT 0 AND arrayLen(m.len) GT 1) {
                 var val = mid(combined, m.pos[2], m.len[2]);
-                // Strip surrounding single- or double-quotes
                 return trim(reReplace(val, "^[" & chr(34) & "']|[" & chr(34) & "']$", "", "ALL"));
             }
             return "";
         }
 
-        // base64-decode a string payload to byte[]
-        // Whitespace stripping uses chr() calls to avoid \s mangling.
         function b64decode(required string payload) {
             var clean = reReplace(arguments.payload, "[ " & chr(9) & chr(13) & chr(10) & "]+", "", "ALL");
             if (NOT len(clean)) return javaCast("null","");
@@ -274,7 +250,6 @@
         var topFN    = getFilename(topCD, topCT);
         var boundary = getBoundary(topCT);
 
-        // Path 1: top-level Content-Type IS the attachment (e.g. Google single-part ZIP)
         if (isDmarcPart(topCT, topFN) AND NOT len(boundary)) {
             if (lCase(trim(topCTE)) EQ "base64") {
                 try {
@@ -289,13 +264,11 @@
             }
         }
 
-        // Path 2: multipart - split on boundary, find attachment part
         if (len(boundary)) {
             var result = processParts(splitOnLiteral(arguments.mimeBody, "--" & boundary));
             if (NOT isNull(result)) return result;
         }
 
-        // Path 3: fallback - try entire body as flat base64
         logLine("  MIME: unexpected structure CT=[#left(topCT,60)#] boundary=[#boundary#] bodyLen=#len(arguments.mimeBody)#", "WARN");
         try {
             var dec = b64decode(arguments.mimeBody);
@@ -351,12 +324,9 @@
             result.body = mid(fetchOut, bodyPos + len(bodyLabel), len(fetchOut));
         }
 
-        // Unfold RFC 2822 headers then extract Content-Type and Message-ID.
-        // Use chr()-based unfolding to avoid \r\n mangling.
         var unfolded = reReplace(result.headers,
             "(" & chr(13) & chr(10) & "|" & chr(10) & ")[ " & chr(9) & "]+", " ", "ALL");
 
-        // Content-Type: match to end of line (no \r or \n in char class)
         var ctPat = "(?i)Content-Type:[ " & chr(9) & "]*([^" & chr(13) & chr(10) & "]+)";
         var ctMatch = reFind(ctPat, unfolded, 1, true);
         if (ctMatch.len[1] GT 0 AND arrayLen(ctMatch.len) GT 1)
@@ -368,6 +338,20 @@
             result.messageId = trim(mid(unfolded, midMatch.pos[2], midMatch.len[2]));
 
         return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // isRufContentType(ct)
+    //
+    // Returns true if the Content-Type value indicates a RUF message.
+    // Matches both quoted and unquoted report-type parameter values:
+    //   multipart/report; report-type=feedback-report
+    //   multipart/report; report-type="feedback-report"
+    // -----------------------------------------------------------------------
+    function isRufContentType(required string ct) {
+        if (NOT reFindNoCase("multipart/report", arguments.ct)) return false;
+        // report-type= followed by optional quote, then feedback-report
+        return reFindNoCase("report-type=[" & chr(34) & "']?feedback-report", arguments.ct) GT 0;
     }
 
     // -----------------------------------------------------------------------
@@ -441,7 +425,6 @@
                     msgSubject = qOneHeader.recordCount ? qOneHeader.subject[1] : "";
 
                     rawHdr     = qOneHeader.recordCount ? qOneHeader.header[1] : "";
-                    // Message-ID: to end of line, no \r\n in char class
                     var midPat2  = "(?i)Message-ID:[ " & chr(9) & "]*([^" & chr(13) & chr(10) & "]+)";
                     midMatch     = reFind(midPat2, rawHdr, 1, true);
                     quickMsgId   = "";
@@ -486,9 +469,14 @@
                         continue;
                     }
 
-                    isRUF = reFindNoCase("multipart/report", contentType)
-                            AND reFindNoCase("report-type=feedback-report", contentType);
-                    if (NOT isRUF AND len(fetched.headers)) isRUF = reFindNoCase("feedback-report", fetched.headers);
+                    // RUF detection:
+                    //   Signal 1: Content-Type multipart/report; report-type=["']?feedback-report
+                    //             (handles both quoted and unquoted parameter values)
+                    //   Signal 2: feedback-report appears anywhere in the raw headers
+                    //             (catches malformed or plain-text RUF variants)
+                    isRUF = isRufContentType(contentType);
+                    if (NOT isRUF AND len(fetched.headers))
+                        isRUF = reFindNoCase("feedback-report", fetched.headers) GT 0;
 
                     if (isRUF) {
                         logLine("  uid=#msgUID# -> RUF");
