@@ -39,24 +39,44 @@
         GROUP BY rpt.domain ORDER BY messages DESC
     ", {}, { datasource: application.db.dsn });
 
+    // Trend chart: daily for <=90 days, weekly for 365/all-time.
+    // For "all time" (filterDays=0) there's no date WHERE clause, so we
+    // use a separate trendDateClause that's always present for the trend query.
+    useWeeklyTrend  = (filterDays EQ 0 OR filterDays EQ 365);
+    trendDateClause = filterDays GT 0 ? "WHERE rpt.mindate >= DATE_SUB(NOW(), INTERVAL #filterDays# DAY)" : "";
+
+    if (useWeeklyTrend) {
+        trendGroupExpr  = "DATE(DATE_SUB(rpt.mindate, INTERVAL WEEKDAY(rpt.mindate) DAY))"; // Monday of the week
+        trendLabelExpr  = "DATE_FORMAT(DATE_SUB(rpt.mindate, INTERVAL WEEKDAY(rpt.mindate) DAY), '%b %d')";
+    } else {
+        trendGroupExpr  = "DATE(rpt.mindate)";
+        trendLabelExpr  = "DATE_FORMAT(rpt.mindate, '%b %d')";
+    }
+
     qTrend = queryExecute("
-        SELECT DATE(rpt.mindate) AS report_date,
+        SELECT #trendLabelExpr# AS period_label,
             SUM(rec.rcount) AS messages,
             SUM(CASE WHEN rec.dkim_align='pass' OR rec.spf_align='pass' THEN rec.rcount ELSE 0 END) AS pass_count
         FROM report rpt
         LEFT JOIN rptrecord rec ON rec.report_id = rpt.id
-        WHERE rpt.mindate >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-        GROUP BY DATE(rpt.mindate) ORDER BY report_date ASC
+        #trendDateClause#
+        GROUP BY #trendGroupExpr#
+        ORDER BY #trendGroupExpr# ASC
     ", {}, { datasource: application.db.dsn });
 
     chartDates    = [];
     chartMessages = [];
     chartPassRate = [];
     for (row in qTrend) {
-        arrayAppend(chartDates,    '"#dateFormat(row.report_date, "mmm d")#"');
+        arrayAppend(chartDates,    '"#row.period_label#"');
         arrayAppend(chartMessages, row.messages);
         arrayAppend(chartPassRate, row.messages GT 0 ? numberFormat(100*row.pass_count/row.messages, "99.9") : 0);
     }
+
+    // Chart title mirrors the date filter label
+    chartTitle = useWeeklyTrend
+        ? "Message Volume & Pass Rate — #dateLabel# (weekly)"
+        : "Message Volume & Pass Rate — #dateLabel#";
 
     qRecent = queryExecute("
         SELECT rpt.id, rpt.domain, rpt.org, rpt.received_at,
@@ -121,7 +141,7 @@
 
 <div class="row g-3 mb-3">
     <div class="col-lg-8"><div class="card h-100">
-        <div class="card-header">Message Volume &amp; Pass Rate — Last 30 Days</div>
+        <div class="card-header">#htmlEditFormat(chartTitle)#</div>
         <div class="card-body"><div id="chart-trend" style="min-height:240px;"></div></div>
     </div></div>
     <div class="col-lg-4"><div class="card h-100">
