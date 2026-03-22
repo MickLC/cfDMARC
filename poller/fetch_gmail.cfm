@@ -11,8 +11,16 @@
 
       RUF vs RUA handling:
         RUA: ZIP/GZ/XML attachment bytes extracted into `attachments` array.
-        RUF: No attachment. Report is the message body (multipart/report).
-             msgBody assembled from payload parts via extractGmailRufBody().
+        RUF: No attachment. Report is the message body (multipart/report or
+             plain-text forensic notification). msgBody assembled from payload
+             parts via extractGmailRufBody().
+
+      RUF detection (isRUF) covers three formats observed in the wild:
+        1. Standard ARF: Content-Type multipart/report; report-type=feedback-report
+        2. Plain-text forensic notification: subject matches
+           "DMARC Forensic Report" or "DMARC Failure Report" (antispamcloud,
+           Validity/ReturnPath, etc.)
+        3. Auto-submitted with forensic-report-like subject
 
       Lucee string-literal gotchas:
         - Do NOT embed literal " inside double-quoted CFML strings passed to
@@ -21,6 +29,8 @@
         - Do NOT use \s, \r, \n, \t in double-quoted CFML string literals.
           Lucee's string parser consumes the backslash. Use chr() or explicit
           character classes like [ \t] instead.
+        - \\s (double-backslash) in a CFML string literal becomes \s in the
+          string value, which the regex engine sees correctly as whitespace.
 --->
 <cfscript>
 
@@ -227,7 +237,7 @@
 
             var isDmarc = false;
             if (reFindNoCase("application/(zip|gzip|x-zip|x-zip-compressed|x-gzip|octet-stream|xml)", mimeType)) isDmarc = true;
-            if (reFindNoCase("\.( zip|gz|xml)$", filename)) isDmarc = true;
+            if (reFindNoCase("\.(zip|gz|xml)$", filename)) isDmarc = true;
 
             if (NOT isDmarc) continue;
 
@@ -252,8 +262,12 @@
     // extractGmailRufBody(payload)
     //
     // Reassembles MIME body text from a Gmail format=full payload for
-    // parse_ruf.cfm. Walks parts[] tree, decodes base64url body data,
-    // and prefixes each part with its Content-Type line.
+    // parse_ruf.cfm. Handles three structures:
+    //   1. multipart - walks parts[] tree, decoding each part
+    //   2. single-part with body.data inline (e.g. text/plain forensic notify)
+    //   3. single-part with body.attachmentId (rare but possible)
+    // Each part is prefixed with its Content-Type line so parse_ruf.cfm's
+    // regex searches for "Content-Type: message/feedback-report" still work.
     // -----------------------------------------------------------------------
     function extractGmailRufBody(required struct payload) {
         var sb = createObject("java", "java.lang.StringBuilder").init();
@@ -268,16 +282,22 @@
                     continue;
                 }
 
+                // Emit Content-Type header so parse_ruf.cfm can locate parts
                 sb.append("Content-Type: " & mimeType & chr(10));
                 sb.append(chr(10));
 
                 var partData = "";
-                if (structKeyExists(part, "body") AND isStruct(part.body)
-                        AND structKeyExists(part.body, "data") AND len(part.body.data)) {
-                    try {
-                        partData = b64urlDecodeToString(part.body.data);
-                    } catch(any e) {
-                        partData = "";
+                if (structKeyExists(part, "body") AND isStruct(part.body)) {
+                    if (structKeyExists(part.body, "data") AND len(part.body.data)) {
+                        try { partData = b64urlDecodeToString(part.body.data); } catch(any e) { partData = ""; }
+                    } else if (structKeyExists(part.body, "attachmentId") AND len(part.body.attachmentId)) {
+                        // Rare: body text stored as attachment - fetch it
+                        try {
+                            var attResp = gmailApiGet(gmailToken,
+                                "messages/" & gmailMsgId & "/attachments/" & part.body.attachmentId);
+                            if (structKeyExists(attResp, "data") AND len(attResp.data))
+                                partData = b64urlDecodeToString(attResp.data);
+                        } catch(any e) { partData = ""; }
                     }
                 }
                 sb.append(partData);
@@ -286,12 +306,23 @@
         }
 
         if (structKeyExists(arguments.payload, "parts") AND isArray(arguments.payload.parts) AND arrayLen(arguments.payload.parts)) {
+            // Multipart message: emit top-level Content-Type then walk parts
+            var topMimeType = trim(arguments.payload.mimeType ?: "");
+            if (len(topMimeType)) {
+                sb.append("Content-Type: " & topMimeType & chr(10));
+                sb.append(chr(10));
+            }
             walkParts(arguments.payload.parts);
-        } else if (structKeyExists(arguments.payload, "body") AND isStruct(arguments.payload.body)
-                AND structKeyExists(arguments.payload.body, "data") AND len(arguments.payload.body.data)) {
-            try {
-                sb.append(b64urlDecodeToString(arguments.payload.body.data));
-            } catch(any e) {}
+        } else if (structKeyExists(arguments.payload, "body") AND isStruct(arguments.payload.body)) {
+            // Single-part message (e.g. plain-text forensic notification)
+            var topMimeType = trim(arguments.payload.mimeType ?: "");
+            if (len(topMimeType)) {
+                sb.append("Content-Type: " & topMimeType & chr(10));
+                sb.append(chr(10));
+            }
+            if (structKeyExists(arguments.payload.body, "data") AND len(arguments.payload.body.data)) {
+                try { sb.append(b64urlDecodeToString(arguments.payload.body.data)); } catch(any e) {}
+            }
         }
 
         return sb.toString();
@@ -400,7 +431,6 @@
                                        ? gmailMeta.payload.headers : [];
 
                         rawMsgId   = extractHeaderValue(metaHeaders, "message-id");
-                        // Strip angle brackets and whitespace - no \s in string literals
                         cleanMsgId = reReplace(trim(rawMsgId),
                                                "[<> " & chr(9) & chr(13) & chr(10) & "]+", "", "ALL");
                         if (NOT len(cleanMsgId)) cleanMsgId = "gmail-" & gmailMsgId;
@@ -431,8 +461,9 @@
                                                  "[<> " & chr(9) & chr(13) & chr(10) & "]+", "", "ALL")
                                      : cleanMsgId;
 
-                        msgSubject  = extractHeaderValue(gmailHeaders, "subject");
-                        contentType = extractHeaderValue(gmailHeaders, "content-type");
+                        msgSubject     = extractHeaderValue(gmailHeaders, "subject");
+                        contentType    = extractHeaderValue(gmailHeaders, "content-type");
+                        autoSubmitted  = extractHeaderValue(gmailHeaders, "auto-submitted");
 
                         qDupe = queryExecute(
                             "SELECT id FROM report WHERE message_id=? LIMIT 1",
@@ -450,8 +481,36 @@
                             continue;
                         }
 
-                        isRUF = reFindNoCase("multipart/report", contentType)
-                                AND reFindNoCase("report-type=feedback-report", contentType);
+                        // -------------------------------------------------------
+                        // RUF detection - three signals, any one is sufficient:
+                        //
+                        // 1. Standard ARF Content-Type:
+                        //    multipart/report; report-type=feedback-report
+                        //
+                        // 2. Plain-text forensic notification subject
+                        //    (antispamcloud, Validity/ReturnPath, and others):
+                        //    Subject: DMARC Forensic Report for ...
+                        //    Subject: DMARC Failure Report for ...
+                        //    Subject: Re: DMARC Forensic/Failure Report ...
+                        //
+                        // 3. Auto-submitted header present AND subject contains
+                        //    "DMARC" (catches edge cases from less common senders)
+                        // -------------------------------------------------------
+                        isRUF = false;
+
+                        // Signal 1: standard ARF Content-Type
+                        if (reFindNoCase("multipart/report", contentType)
+                                AND reFindNoCase("report-type=feedback-report", contentType))
+                            isRUF = true;
+
+                        // Signal 2: forensic/failure report subject line
+                        if (NOT isRUF AND reFindNoCase("DMARC (Forensic|Failure) Report", msgSubject))
+                            isRUF = true;
+
+                        // Signal 3: auto-submitted + DMARC in subject
+                        if (NOT isRUF AND len(autoSubmitted) AND reFindNoCase("DMARC", msgSubject)
+                                AND reFindNoCase("Report", msgSubject))
+                            isRUF = true;
 
                         if (isRUF) {
 
@@ -467,7 +526,7 @@
                                 continue;
                             }
 
-                            logLine("  Gmail: msg=#gmailMsgId# -> RUF");
+                            logLine("  Gmail: msg=#gmailMsgId# -> RUF (sub=#left(msgSubject,60)#)");
                             include "/poller/parse_ruf.cfm";
 
                         } else {
@@ -486,7 +545,7 @@
                             } else if (structKeyExists(gmailPayload, "body") AND isStruct(gmailPayload.body)) {
                                 isDmarcTopLevel = false;
                                 if (reFindNoCase("application/(zip|gzip|x-zip|x-gzip|octet-stream|xml)", topMime)) isDmarcTopLevel = true;
-                                if (reFindNoCase("\.( zip|gz|xml)$", topFile)) isDmarcTopLevel = true;
+                                if (reFindNoCase("\.(zip|gz|xml)$", topFile)) isDmarcTopLevel = true;
 
                                 if (isDmarcTopLevel) {
                                     topBytes = javaCast("null", "");
