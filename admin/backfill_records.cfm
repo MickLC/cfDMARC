@@ -2,32 +2,24 @@
       One-time tool to backfill rptrecord rows for all report rows that
       have raw_reports XML but 0 associated rptrecord rows.
 
-      This repairs the historical dataset affected by the XmlName case bug:
-      Lucee returns XmlName in uppercase, so "child.XmlName NEQ 'record'"
-      never matched, silently skipping every record element and writing
-      "inserted 0 record row(s)" for every report since the poller launched.
+      Pagination uses a cursor (WHERE r.id > afterId) rather than OFFSET.
+      OFFSET re-evaluates the NOT EXISTS subquery on every page, so reports
+      with no <record> elements (empty Microsoft/docomo reports) never leave
+      the result set and the count never decreases. The cursor advances by
+      the highest report.id seen in the last batch, guaranteeing forward
+      progress regardless of whether any rptrecord rows were inserted.
 
-      Safe to re-run: skips any report that already has rptrecord rows.
-      Reports with no <record> elements (e.g. Microsoft metadata-only
-      reports) will count as processed but insert 0 rows — this is correct.
-      Keep clicking "Continue" until it reports nothing left to process.
-
-      Access: admin session required (same as all other admin pages).
+      Access: admin session required.
 --->
 <cfinclude template="/includes/auth.cfm">
 
 <cfscript>
-    param name="url.offset"    default="0"  type="numeric";
+    param name="url.afterId"   default="0"  type="numeric";
     param name="url.batchSize" default="50" type="numeric";
 
-    // Clamp batch size: min 1, max 200
     batchSize = max(1, min(200, url.batchSize));
-    offset    = max(0, url.offset);
+    afterId   = max(0, url.afterId);
 
-    // -----------------------------------------------------------------------
-    // getNodeText — identical to parse_rua.cfm; inline here so this page
-    // is self-contained and won't be affected by future changes to the poller.
-    // -----------------------------------------------------------------------
     function getNodeText(required any xmlNode, required string path, string defaultVal="") {
         try {
             var parts   = listToArray(arguments.path, ".");
@@ -41,38 +33,39 @@
         } catch(any e) { return arguments.defaultVal; }
     }
 
-    // -----------------------------------------------------------------------
-    // Count total reports that still need backfilling.
-    // -----------------------------------------------------------------------
+    // Total still to process from this cursor position onward.
+    // Used only for the progress display — not for pagination logic.
     qTotalNeeded = queryExecute(
         "SELECT COUNT(*) AS cnt
          FROM   report r
-         WHERE  r.raw_reports IS NOT NULL
+         WHERE  r.id > ?
+           AND  r.raw_reports IS NOT NULL
            AND  r.raw_reports <> ''
            AND  NOT EXISTS (
                     SELECT 1 FROM rptrecord rr WHERE rr.report_id = r.id
                 )",
-        {},
+        [ { value: afterId, cfsqltype: "cf_sql_integer" } ],
         { datasource: application.db.dsn }
     );
-    totalNeeded = qTotalNeeded.cnt;
+    totalRemaining = qTotalNeeded.cnt;
 
-    // -----------------------------------------------------------------------
-    // Fetch this batch.
-    // -----------------------------------------------------------------------
+    // Fetch this batch — all reports with raw_reports and no rptrecord rows,
+    // above the cursor. Includes empty reports (no <record> elements): we
+    // process and advance past them rather than re-queuing them forever.
     qBatch = queryExecute(
         "SELECT r.id, r.domain, r.org, r.raw_reports
          FROM   report r
-         WHERE  r.raw_reports IS NOT NULL
+         WHERE  r.id > ?
+           AND  r.raw_reports IS NOT NULL
            AND  r.raw_reports <> ''
            AND  NOT EXISTS (
                     SELECT 1 FROM rptrecord rr WHERE rr.report_id = r.id
                 )
          ORDER  BY r.id ASC
-         LIMIT  ? OFFSET ?",
+         LIMIT  ?",
         [
-            { value: batchSize, cfsqltype: "cf_sql_integer" },
-            { value: offset,    cfsqltype: "cf_sql_integer" }
+            { value: afterId,    cfsqltype: "cf_sql_integer" },
+            { value: batchSize,  cfsqltype: "cf_sql_integer" }
         ],
         { datasource: application.db.dsn }
     );
@@ -81,17 +74,14 @@
     cntOk       = 0;
     cntFail     = 0;
     failDetails = [];
+    lastIdSeen  = afterId;
 
-    // -----------------------------------------------------------------------
-    // Process each report in the batch.
-    // The outer try/catch catches true failures: XML that cannot be parsed
-    // at all. A DB error on one record (bad sender data) is caught by an
-    // inner try/catch and skips only that record, not the whole report.
-    // -----------------------------------------------------------------------
     for (row in qBatch) {
 
+        // Always advance the cursor, even if this report fails or has 0 records
+        lastIdSeen = row.id;
+
         try {
-            // Strip UTF-8 BOM if present
             xmlStr = row.raw_reports;
             if (len(xmlStr) AND asc(left(xmlStr, 1)) EQ 65279) {
                 xmlStr = mid(xmlStr, 2, len(xmlStr) - 1);
@@ -178,9 +168,21 @@
         }
     }
 
-    remaining  = totalNeeded - batchCount;
-    nextOffset = offset + batchSize;
-    isDone     = (batchCount EQ 0);
+    // After this batch, remaining = reports above lastIdSeen still needing work
+    qAfter = queryExecute(
+        "SELECT COUNT(*) AS cnt
+         FROM   report r
+         WHERE  r.id > ?
+           AND  r.raw_reports IS NOT NULL
+           AND  r.raw_reports <> ''
+           AND  NOT EXISTS (
+                    SELECT 1 FROM rptrecord rr WHERE rr.report_id = r.id
+                )",
+        [ { value: lastIdSeen, cfsqltype: "cf_sql_integer" } ],
+        { datasource: application.db.dsn }
+    );
+    remaining = qAfter.cnt;
+    isDone    = (batchCount EQ 0);
 
     variables.pageTitle = "Backfill rptrecord";
     variables.activeNav = "";
@@ -211,23 +213,21 @@
             Repairs reports affected by the <code>XmlName</code> case bug &mdash; every report
             inserted before the fix has a header row but 0 record rows.
             Reads <code>raw_reports</code> XML from each affected row and inserts the missing
-            <code>rptrecord</code> entries. Safe to re-run; reports that already have records
-            are skipped automatically. Reports with no <code>&lt;record&gt;</code> elements
-            (e.g. Microsoft metadata-only reports) count as processed with 0 rows inserted
-            &mdash; this is correct behaviour.
+            <code>rptrecord</code> entries. Reports with no <code>&lt;record&gt;</code> elements
+            (e.g. Microsoft or docomo metadata-only reports) are advanced past automatically.
         </p>
 
         <cfif isDone>
 
-            <div class="done-msg"><i class="bi bi-check-circle-fill me-2"></i>Nothing left to backfill &mdash; all reports with raw XML have been processed.</div>
+            <div class="done-msg"><i class="bi bi-check-circle-fill me-2"></i>Nothing left to backfill &mdash; all reports have been processed.</div>
             <a href="/admin/dashboard.cfm" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>Dashboard</a>
 
         <cfelse>
 
             <div class="stat-row">
                 <div class="stat-tile">
-                    <div class="stat-label">Needed at start</div>
-                    <div class="stat-value mono"><cfoutput>#numberFormat(totalNeeded)#</cfoutput></div>
+                    <div class="stat-label">In queue at start</div>
+                    <div class="stat-value mono"><cfoutput>#numberFormat(totalRemaining)#</cfoutput></div>
                 </div>
                 <div class="stat-tile">
                     <div class="stat-label">This batch</div>
@@ -248,12 +248,11 @@
             </div>
 
             <cfif arrayLen(failDetails)>
-                <div class="section-hd">Report failures this batch (XML could not be parsed at all)</div>
+                <div class="section-hd">Report failures this batch (XML could not be parsed)</div>
                 <p style="font-size:.8rem;color:var(--text-muted);margin-bottom:.5rem;">
-                    These reports had XML that could not be parsed. Individual record-level DB
-                    errors (e.g. oversized fields from non-compliant senders) are silently skipped
-                    per record and do not appear here. True parse failures will keep reappearing
-                    until re-ingested from the original email attachments.
+                    Individual record-level DB errors are silently skipped per record and do not
+                    appear here. Only reports whose XML could not be parsed at all are listed.
+                    The cursor has advanced past them so they will not block further batches.
                 </p>
                 <table class="fail-tbl">
                     <thead><tr><th>ID</th><th>Org</th><th>Domain</th><th>Error</th></tr></thead>
@@ -273,9 +272,9 @@
             </cfif>
 
             <div style="margin-top:1.25rem;display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;">
-                <cfif remaining GT 0>
+                <cfif remaining GT 0 OR batchCount GT 0>
                     <cfoutput>
-                    <a href="/admin/backfill_records.cfm?offset=#nextOffset#&batchSize=#batchSize#"
+                    <a href="/admin/backfill_records.cfm?afterId=#lastIdSeen#&batchSize=#batchSize#"
                        class="btn btn-success btn-sm">
                         Continue <i class="bi bi-arrow-right ms-1"></i>
                         (#numberFormat(remaining)# remaining)
@@ -291,14 +290,14 @@
 
                 <form method="get" action="/admin/backfill_records.cfm"
                       style="display:inline-flex;align-items:center;gap:.4rem;margin-left:.5rem;">
-                    <input type="hidden" name="offset" value="0">
+                    <input type="hidden" name="afterId" value="0">
                     <label style="font-size:.8rem;color:var(--text-muted);margin:0;">Batch:</label>
                     <input type="number" name="batchSize"
                            value="<cfoutput>#batchSize#</cfoutput>"
                            min="1" max="200"
                            class="form-control form-control-sm"
                            style="width:70px;">
-                    <button type="submit" class="btn btn-outline-secondary btn-sm">Restart</button>
+                    <button type="submit" class="btn btn-outline-secondary btn-sm">Restart from beginning</button>
                 </form>
             </div>
 
