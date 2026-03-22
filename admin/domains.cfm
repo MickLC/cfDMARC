@@ -62,17 +62,18 @@
     ", {}, { datasource: application.db.dsn });
 
     // Build sparkline data structures: { domain: { msgs:[], rates:[] } }
+    // Note: no var keyword here — var is only valid inside functions in Lucee.
     sparkData = {};
     for (trow in qTrends) {
-        var d = trow.domain;
-        if (NOT structKeyExists(sparkData, d)) {
-            sparkData[d] = { msgs: [], rates: [] };
+        trendDomain = trow.domain;
+        if (NOT structKeyExists(sparkData, trendDomain)) {
+            sparkData[trendDomain] = { msgs: [], rates: [] };
         }
-        arrayAppend(sparkData[d].msgs,  trow.messages);
-        var rate = trow.messages GT 0
+        arrayAppend(sparkData[trendDomain].msgs, trow.messages);
+        trendRate = trow.messages GT 0
             ? numberFormat(100 * trow.pass_count / trow.messages, "99.9")
             : 0;
-        arrayAppend(sparkData[d].rates, rate);
+        arrayAppend(sparkData[trendDomain].rates, trendRate);
     }
 
     // ── Policy helpers ────────────────────────────────────────────────────────
@@ -285,7 +286,6 @@
         </div>
 
         <!--- Sparkline script for this domain --->
-        <cfset sparkMsgs  = structKeyExists(sparkData, dom) ? sparkData[dom].msgs  : []>
         <cfset sparkRates = structKeyExists(sparkData, dom) ? sparkData[dom].rates : []>
         <script>
         (function(){
