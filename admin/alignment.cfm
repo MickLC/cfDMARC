@@ -2,6 +2,58 @@
 <cfinclude template="/includes/auth.cfm">
 <cfinclude template="/includes/functions.cfm">
 
+<!--- Page-scoped styles — outside cfoutput so hex colors need no ## escaping --->
+<style>
+    .outcome-tile {
+        display: block;
+        background: var(--bg-card);
+        border: 1px solid var(--border-color);
+        border-radius: 6px;
+        padding: 0.85rem 1rem;
+        text-decoration: none;
+        transition: border-color 0.15s, background 0.15s;
+        cursor: pointer;
+    }
+    .outcome-tile:hover  { background: var(--bg-card-hover); border-color: #444c56; }
+    .outcome-tile.active { border-color: var(--accent-blue); background: rgba(56,139,253,0.06); }
+
+    .outcome-icons { margin-bottom: 0.5rem; }
+    .outcome-value {
+        font-family: var(--font-mono);
+        font-size: 1.5rem;
+        font-weight: 600;
+        color: var(--text-primary);
+        line-height: 1;
+    }
+    .outcome-pct   { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem; }
+    .outcome-label { font-size: 0.72rem; color: var(--text-secondary); margin-top: 0.3rem; }
+
+    .outcome-neither .outcome-value { color: var(--accent-red); }
+
+    .auth-pill {
+        display: inline-block;
+        font-family: var(--font-mono);
+        font-size: 0.62rem;
+        font-weight: 600;
+        padding: 0.15em 0.45em;
+        border-radius: 3px;
+        letter-spacing: 0.04em;
+        margin-right: 2px;
+    }
+    .auth-pass { background: rgba(63,185,80,.15);  color: var(--accent-green); border: 1px solid rgba(63,185,80,.3); }
+    .auth-fail { background: rgba(248,81,73,.12);  color: var(--accent-red);   border: 1px solid rgba(248,81,73,.25); }
+
+    .disp-row {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.78rem;
+        color: var(--text-secondary);
+        margin-bottom: 0.25rem;
+    }
+
+    .align-table tbody tr:hover td { background: var(--bg-card-hover) !important; }
+</style>
+
 <cfscript>
     // ── Filters ───────────────────────────────────────────────────────────────
     param name="url.days"    default="30";
@@ -72,18 +124,18 @@
             #domainClause#
     ", baseParams, { datasource: application.db.dsn });
 
-    total        = qSummary.total GT 0 ? qSummary.total : 0;
-    bothPass     = qSummary.both_pass;
-    dkimOnly     = qSummary.dkim_only;
-    spfOnly      = qSummary.spf_only;
-    neitherPass  = qSummary.neither;
-    dmarcPass    = bothPass + dkimOnly + spfOnly;  // DMARC passes on either auth method
+    total       = qSummary.total GT 0 ? qSummary.total : 0;
+    bothPass    = qSummary.both_pass;
+    dkimOnly    = qSummary.dkim_only;
+    spfOnly     = qSummary.spf_only;
+    neitherPass = qSummary.neither;
+    dmarcPass   = bothPass + dkimOnly + spfOnly;  // DMARC passes on either auth method
 
     pctOf = function(n) {
         return total GT 0 ? numberFormat(100 * n / total, "99.9") : 0;
     };
 
-    // ── Top DKIM selectors (for failing messages) ─────────────────────────────
+    // ── Top DKIM signing domains ──────────────────────────────────────────────
     qSelectors = queryExecute("
         SELECT
             rec.dkimdomain,
@@ -100,7 +152,7 @@
         LIMIT 10
     ", baseParams, { datasource: application.db.dsn });
 
-    // ── Top SPF domains ───────────────────────────────────────────────────────
+    // ── Top SPF envelope-from domains ─────────────────────────────────────────
     qSPFDomains = queryExecute("
         SELECT
             rec.spfdomain,
@@ -163,9 +215,9 @@
 
     // ── URL builder helper (preserves all filters) ────────────────────────────
     function pageUrl(numeric p, string outcome="", string domain="") {
-        var q = "?days=#filterDays#&page=#p#";
-        var o = len(arguments.outcome) ? arguments.outcome : filterOutcome;
-        var dm = len(arguments.domain) ? arguments.domain : filterDomain;
+        var q  = "?days=#filterDays#&page=#p#";
+        var o  = len(arguments.outcome) ? arguments.outcome : filterOutcome;
+        var dm = len(arguments.domain)  ? arguments.domain  : filterDomain;
         if (len(o))  q &= "&outcome=#o#";
         if (len(dm)) q &= "&domain=#urlEncodedFormat(dm)#";
         return q;
@@ -204,7 +256,7 @@
     </div>
 
     <div class="btn-group btn-group-sm">
-        <cfset dSuffix = len(filterDomain) ? "&domain=" & urlEncodedFormat(filterDomain) : "">
+        <cfset dSuffix = len(filterDomain)  ? "&domain="  & urlEncodedFormat(filterDomain)  : "">
         <cfset oSuffix = len(filterOutcome) ? "&outcome=" & filterOutcome : "">
         <a href="?days=7#oSuffix##dSuffix#"   class="btn btn-outline-secondary #(filterDays EQ 7   ? 'active':'')#">7d</a>
         <a href="?days=30#oSuffix##dSuffix#"  class="btn btn-outline-secondary #(filterDays EQ 30  ? 'active':'')#">30d</a>
@@ -217,7 +269,6 @@
 <!--- ── Outcome matrix ──────────────────────────────────────────────────── --->
 <div class="row g-3 mb-3">
 
-    <!--- DMARC pass (both + either) --->
     <div class="col-6 col-lg-3">
         <a href="#pageUrl(1, 'both')#" class="outcome-tile outcome-both #(filterOutcome EQ 'both' ? 'active' : '')#">
             <div class="outcome-icons">
@@ -467,7 +518,6 @@
                 <cfloop query="qRecords">
                     <cfset dkimPass = (lCase(qRecords.dkim_align) EQ "pass")>
                     <cfset spfPass  = (lCase(qRecords.spf_align)  EQ "pass")>
-                    <cfset dmarcOk  = dkimPass OR spfPass>
                     <tr>
                         <td class="mono" style="font-size:0.75rem;white-space:nowrap;">
                             #htmlEditFormat(qRecords.source_ip)#
@@ -561,57 +611,6 @@
         </cfif>
     </div>
 </div>
-
-<style>
-    .outcome-tile {
-        display: block;
-        background: var(--bg-card);
-        border: 1px solid var(--border-color);
-        border-radius: 6px;
-        padding: 0.85rem 1rem;
-        text-decoration: none;
-        transition: border-color 0.15s, background 0.15s;
-        cursor: pointer;
-    }
-    .outcome-tile:hover { background: var(--bg-card-hover); border-color: #444c56; }
-    .outcome-tile.active { border-color: var(--accent-blue); background: rgba(56,139,253,0.06); }
-
-    .outcome-icons  { margin-bottom: 0.5rem; }
-    .outcome-value  {
-        font-family: var(--font-mono);
-        font-size: 1.5rem;
-        font-weight: 600;
-        color: var(--text-primary);
-        line-height: 1;
-    }
-    .outcome-pct   { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem; }
-    .outcome-label { font-size: 0.72rem; color: var(--text-secondary); margin-top: 0.3rem; }
-
-    .outcome-neither .outcome-value { color: var(--accent-red); }
-
-    .auth-pill {
-        display: inline-block;
-        font-family: var(--font-mono);
-        font-size: 0.62rem;
-        font-weight: 600;
-        padding: 0.15em 0.45em;
-        border-radius: 3px;
-        letter-spacing: 0.04em;
-        margin-right: 2px;
-    }
-    .auth-pass { background: rgba(63,185,80,.15);  color: var(--accent-green); border: 1px solid rgba(63,185,80,.3); }
-    .auth-fail { background: rgba(248,81,73,.12);  color: var(--accent-red);   border: 1px solid rgba(248,81,73,.25); }
-
-    .disp-row {
-        display: flex;
-        justify-content: space-between;
-        font-size: 0.78rem;
-        color: var(--text-secondary);
-        margin-bottom: 0.25rem;
-    }
-
-    .align-table tbody tr:hover td { background: var(--bg-card-hover) !important; }
-</style>
 
 </cfoutput>
 
