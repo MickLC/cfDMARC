@@ -43,15 +43,6 @@
 
     // -----------------------------------------------------------------------
     // Count total reports that still need backfilling.
-    // A report "needs backfilling" if it has raw_reports content but has no
-    // rows in rptrecord. We re-count on every batch load so the display
-    // accurately reflects what prior batches already completed.
-    //
-    // Note: reports with no <record> elements (Microsoft metadata-only
-    // reports) will never have rptrecord rows and will keep appearing here.
-    // They are processed correctly — 0 rows inserted is correct for them —
-    // but they'll always pass the NOT EXISTS check. We accept that; they
-    // are counted in cntOk, not cntFail.
     // -----------------------------------------------------------------------
     qTotalNeeded = queryExecute(
         "SELECT COUNT(*) AS cnt
@@ -93,11 +84,14 @@
 
     // -----------------------------------------------------------------------
     // Process each report in the batch.
+    // The outer try/catch catches true failures: XML that cannot be parsed
+    // at all. A DB error on one record (bad sender data) is caught by an
+    // inner try/catch and skips only that record, not the whole report.
     // -----------------------------------------------------------------------
     for (row in qBatch) {
 
         try {
-            // Strip UTF-8 BOM if present (same fix as parse_rua.cfm)
+            // Strip UTF-8 BOM if present
             xmlStr = row.raw_reports;
             if (len(xmlStr) AND asc(left(xmlStr, 1)) EQ 65279) {
                 xmlStr = mid(xmlStr, 2, len(xmlStr) - 1);
@@ -107,9 +101,9 @@
             fb  = rpt.feedback;
 
             recInserted = 0;
+            recSkipped  = 0;
 
             for (child in fb.xmlChildren) {
-                // lCase() required: Lucee returns XmlName in uppercase
                 if (lCase(child.XmlName) NEQ "record") continue;
 
                 rec = child;
@@ -138,9 +132,9 @@
                 if (len(reasonType))    { optCols &= ", reason";     optVals &= ", ?"; arrayAppend(optParams, { value: left(reasonType,100),    cfsqltype: "cf_sql_varchar" }); }
                 if (len(reasonComment)) { optCols &= ", comment";    optVals &= ", ?"; arrayAppend(optParams, { value: left(reasonComment,255), cfsqltype: "cf_sql_varchar" }); }
                 if (len(dkimDomain))    { optCols &= ", dkimdomain"; optVals &= ", ?"; arrayAppend(optParams, { value: left(dkimDomain,253),    cfsqltype: "cf_sql_varchar" }); }
-                if (len(dkimResult))    { optCols &= ", dkimresult"; optVals &= ", ?"; arrayAppend(optParams, { value: left(dkimResult,20),     cfsqltype: "cf_sql_varchar" }); }
+                if (len(dkimResult))    { optCols &= ", dkimresult"; optVals &= ", ?"; arrayAppend(optParams, { value: left(dkimResult,50),     cfsqltype: "cf_sql_varchar" }); }
                 if (len(spfDomain))     { optCols &= ", spfdomain";  optVals &= ", ?"; arrayAppend(optParams, { value: left(spfDomain,253),     cfsqltype: "cf_sql_varchar" }); }
-                if (len(spfResult))     { optCols &= ", spfresult";  optVals &= ", ?"; arrayAppend(optParams, { value: left(spfResult,20),      cfsqltype: "cf_sql_varchar" }); }
+                if (len(spfResult))     { optCols &= ", spfresult";  optVals &= ", ?"; arrayAppend(optParams, { value: left(spfResult,50),      cfsqltype: "cf_sql_varchar" }); }
 
                 baseParams = [
                     { value: row.id,               cfsqltype: "cf_sql_integer" },
@@ -152,20 +146,23 @@
                     { value: left(hFrom,253),      cfsqltype: "cf_sql_varchar" }
                 ];
 
-                queryExecute(
-                    "INSERT INTO rptrecord
-                         (report_id, #ipColSQL#, rcount, disposition,
-                          spf_align, dkim_align, identifier_hfrom
-                          #optCols#)
-                     VALUES
-                         (?, #ipValSQL#, ?, ?,
-                          ?, ?, ?
-                          #optVals#)",
-                    arrayMerge(baseParams, optParams),
-                    { datasource: application.db.dsn }
-                );
-
-                recInserted++;
+                try {
+                    queryExecute(
+                        "INSERT INTO rptrecord
+                             (report_id, #ipColSQL#, rcount, disposition,
+                              spf_align, dkim_align, identifier_hfrom
+                              #optCols#)
+                         VALUES
+                             (?, #ipValSQL#, ?, ?,
+                              ?, ?, ?
+                              #optVals#)",
+                        arrayMerge(baseParams, optParams),
+                        { datasource: application.db.dsn }
+                    );
+                    recInserted++;
+                } catch(any recErr) {
+                    recSkipped++;
+                }
             }
 
             cntOk++;
@@ -241,7 +238,7 @@
                     <div class="stat-value mono color-ok"><cfoutput>#cntOk#</cfoutput></div>
                 </div>
                 <div class="stat-tile">
-                    <div class="stat-label">Parse errors</div>
+                    <div class="stat-label">Report failures</div>
                     <div class="stat-value mono <cfoutput>#cntFail GT 0 ? 'color-err' : ''#</cfoutput>"><cfoutput>#cntFail#</cfoutput></div>
                 </div>
                 <div class="stat-tile">
@@ -251,11 +248,12 @@
             </div>
 
             <cfif arrayLen(failDetails)>
-                <div class="section-hd">Parse failures this batch</div>
+                <div class="section-hd">Report failures this batch (XML could not be parsed at all)</div>
                 <p style="font-size:.8rem;color:var(--text-muted);margin-bottom:.5rem;">
-                    These reports had unparseable XML in <code>raw_reports</code>. They will keep
-                    appearing in the backfill queue since they'll never acquire record rows.
-                    To recover them you'd need to re-ingest from the original email attachments.
+                    These reports had XML that could not be parsed. Individual record-level DB
+                    errors (e.g. oversized fields from non-compliant senders) are silently skipped
+                    per record and do not appear here. True parse failures will keep reappearing
+                    until re-ingested from the original email attachments.
                 </p>
                 <table class="fail-tbl">
                     <thead><tr><th>ID</th><th>Org</th><th>Domain</th><th>Error</th></tr></thead>

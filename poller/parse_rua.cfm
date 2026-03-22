@@ -195,9 +195,15 @@
 
     // -------------------------------------------------------------------
     // Insert rptrecord rows
+    // Each record is wrapped in its own try/catch. A DB error on one
+    // record (e.g. non-standard field values from a particular sender)
+    // logs a warning and skips that record rather than aborting the
+    // entire report. The report header row is already committed at this
+    // point so there is nothing to roll back.
     // -------------------------------------------------------------------
     records     = fb.xmlChildren;
     recInserted = 0;
+    recSkipped  = 0;
 
     for (child in records) {
         // XmlName is returned uppercase by Lucee's XML parser regardless of
@@ -230,9 +236,9 @@
         if (len(reasonType))    { optCols &= ", reason";     optVals &= ", ?"; arrayAppend(optParams, { value: left(reasonType,100),    cfsqltype: "cf_sql_varchar" }); }
         if (len(reasonComment)) { optCols &= ", comment";    optVals &= ", ?"; arrayAppend(optParams, { value: left(reasonComment,255), cfsqltype: "cf_sql_varchar" }); }
         if (len(dkimDomain))    { optCols &= ", dkimdomain"; optVals &= ", ?"; arrayAppend(optParams, { value: left(dkimDomain,253),    cfsqltype: "cf_sql_varchar" }); }
-        if (len(dkimResult))    { optCols &= ", dkimresult"; optVals &= ", ?"; arrayAppend(optParams, { value: left(dkimResult,20),     cfsqltype: "cf_sql_varchar" }); }
+        if (len(dkimResult))    { optCols &= ", dkimresult"; optVals &= ", ?"; arrayAppend(optParams, { value: left(dkimResult,50),     cfsqltype: "cf_sql_varchar" }); }
         if (len(spfDomain))     { optCols &= ", spfdomain";  optVals &= ", ?"; arrayAppend(optParams, { value: left(spfDomain,253),     cfsqltype: "cf_sql_varchar" }); }
-        if (len(spfResult))     { optCols &= ", spfresult";  optVals &= ", ?"; arrayAppend(optParams, { value: left(spfResult,20),      cfsqltype: "cf_sql_varchar" }); }
+        if (len(spfResult))     { optCols &= ", spfresult";  optVals &= ", ?"; arrayAppend(optParams, { value: left(spfResult,50),      cfsqltype: "cf_sql_varchar" }); }
 
         baseParams = [
             { value: newReportId,          cfsqltype: "cf_sql_integer" },
@@ -244,22 +250,30 @@
             { value: left(hFrom,253),      cfsqltype: "cf_sql_varchar" }
         ];
 
-        queryExecute(
-            "INSERT INTO rptrecord
-                 (report_id, #ipColSQL#, rcount, disposition,
-                  spf_align, dkim_align, identifier_hfrom
-                  #optCols#)
-             VALUES
-                 (?, #ipValSQL#, ?, ?,
-                  ?, ?, ?
-                  #optVals#)",
-            arrayMerge(baseParams, optParams),
-            { datasource: application.db.dsn }
-        );
-
-        recInserted++;
+        try {
+            queryExecute(
+                "INSERT INTO rptrecord
+                     (report_id, #ipColSQL#, rcount, disposition,
+                      spf_align, dkim_align, identifier_hfrom
+                      #optCols#)
+                 VALUES
+                     (?, #ipValSQL#, ?, ?,
+                      ?, ?, ?
+                      #optVals#)",
+                arrayMerge(baseParams, optParams),
+                { datasource: application.db.dsn }
+            );
+            recInserted++;
+        } catch(any recErr) {
+            recSkipped++;
+            logLine("  RUA: skipped record ip=#sourceIP# report=#newReportId#: #recErr.message#", "WARN");
+        }
     }
 
-    logLine("  RUA: inserted #recInserted# record row(s) for report id=#newReportId#");
+    if (recSkipped GT 0) {
+        logLine("  RUA: inserted #recInserted# record row(s), skipped #recSkipped# for report id=#newReportId#", "WARN");
+    } else {
+        logLine("  RUA: inserted #recInserted# record row(s) for report id=#newReportId#");
+    }
 
 </cfscript>
