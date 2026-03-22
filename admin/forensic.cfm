@@ -15,9 +15,9 @@
         letter-spacing: 0.04em;
         margin-right: 2px;
     }
-    .auth-pass { background: rgba(63,185,80,.15);  color: var(--accent-green); border: 1px solid rgba(63,185,80,.3); }
-    .auth-fail { background: rgba(248,81,73,.12);  color: var(--accent-red);   border: 1px solid rgba(248,81,73,.25); }
-    .auth-unknown { background: rgba(139,148,158,.1); color: var(--text-muted); border: 1px solid var(--border-color); }
+    .auth-pass    { background: rgba(63,185,80,.15);  color: var(--accent-green); border: 1px solid rgba(63,185,80,.3); }
+    .auth-fail    { background: rgba(248,81,73,.12);  color: var(--accent-red);   border: 1px solid rgba(248,81,73,.25); }
+    .auth-unknown { background: rgba(139,148,158,.1); color: var(--text-muted);   border: 1px solid var(--border-color); }
 
     .detail-section-label {
         font-family: var(--font-mono);
@@ -62,24 +62,33 @@
     domainClause = len(filterDomain) ? "AND f.reported_domain = ?" : "";
     typeClause   = len(filterType)   ? "AND f.auth_failure = ?"    : "";
 
+    // When type=unknown we need to match NULL or empty string
+    typeClause = len(filterType) ? (
+        filterType EQ "unknown"
+            ? "AND (f.auth_failure IS NULL OR f.auth_failure = '')"
+            : "AND f.auth_failure = ?"
+    ) : "";
+
     baseParams = [];
     if (len(filterDomain)) arrayAppend(baseParams, { value: filterDomain, cfsqltype: "cf_sql_varchar" });
-    if (len(filterType))   arrayAppend(baseParams, { value: filterType,   cfsqltype: "cf_sql_varchar" });
+    // Only add type param when it's a real value (not "unknown" which uses IS NULL clause)
+    if (len(filterType) AND filterType NEQ "unknown")
+        arrayAppend(baseParams, { value: filterType, cfsqltype: "cf_sql_varchar" });
 
     pageSize    = 50;
     currentPage = isNumeric(url.page) AND url.page GTE 1 ? int(url.page) : 1;
     pageOffset  = (currentPage - 1) * pageSize;
 
-    // ── Summary stats ─────────────────────────────────────────────────────────
+    // ── Summary stats — COALESCE all SUM() to guard against NULL result sets ──
     qStats = queryExecute("
         SELECT
-            COUNT(*)                                                      AS total_reports,
-            COUNT(DISTINCT f.reported_domain)                             AS domains,
-            COUNT(DISTINCT f.source_ip)                                   AS sources,
-            SUM(f.incidents)                                              AS total_incidents,
-            SUM(CASE WHEN f.auth_failure = 'dkim' THEN 1 ELSE 0 END)     AS dkim_failures,
-            SUM(CASE WHEN f.auth_failure = 'spf'  THEN 1 ELSE 0 END)     AS spf_failures,
-            SUM(CASE WHEN f.auth_failure = 'dmarc' THEN 1 ELSE 0 END)    AS dmarc_failures
+            COUNT(*)                                                           AS total_reports,
+            COUNT(DISTINCT f.reported_domain)                                  AS domains,
+            COUNT(DISTINCT f.source_ip)                                        AS sources,
+            COALESCE(SUM(f.incidents), 0)                                      AS total_incidents,
+            COALESCE(SUM(CASE WHEN f.auth_failure = 'dkim'  THEN 1 ELSE 0 END), 0) AS dkim_failures,
+            COALESCE(SUM(CASE WHEN f.auth_failure = 'spf'   THEN 1 ELSE 0 END), 0) AS spf_failures,
+            COALESCE(SUM(CASE WHEN f.auth_failure = 'dmarc' THEN 1 ELSE 0 END), 0) AS dmarc_failures
         FROM failure f
         WHERE 1=1
             #dateClause#
@@ -96,11 +105,13 @@
     ", {}, { datasource: application.db.dsn });
 
     // ── Auth failure type breakdown ───────────────────────────────────────────
+    // Always unfiltered by type so all pills show regardless of current type filter.
+    // COALESCE incidents in case any row somehow has NULLs.
     qTypes = queryExecute("
         SELECT
             COALESCE(NULLIF(f.auth_failure, ''), 'unknown') AS failure_type,
-            COUNT(*)         AS report_count,
-            SUM(f.incidents) AS incidents
+            COUNT(*)                                         AS report_count,
+            COALESCE(SUM(f.incidents), 0)                    AS incidents
         FROM failure f
         WHERE 1=1
             #dateClause#
@@ -138,7 +149,7 @@
             f.original_mail_from,
             f.original_rcpt_to,
             f.reporting_mta,
-            f.incidents,
+            COALESCE(f.incidents, 0) AS incidents,
             f.received_at
         FROM failure f
         WHERE 1=1
