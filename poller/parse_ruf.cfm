@@ -30,10 +30,11 @@
           Also reads the first external IP from a Received: header in the
           text/rfc822-headers or message/rfc822 MIME part.
 
-      Lucee backslash note:
-        \\s in a CFML double-quoted string literal becomes \s in the string
-        value, which the regex engine sees as the whitespace class.
-        Single \s is consumed by Lucee's string parser and becomes plain s.
+      Lucee notes:
+        - reEscape renamed to rufReEscape to avoid collision with Lucee built-in.
+        - \\s in a CFML double-quoted string literal becomes \s in the string
+          value, which the regex engine sees as the whitespace class.
+          Single \s is consumed by Lucee's string parser and becomes plain s.
 --->
 <cfscript>
 
@@ -43,20 +44,24 @@
     }
 
     // -----------------------------------------------------------------------
+    // rufReEscape(s) - escape regex metacharacters in a literal string.
+    // Named rufReEscape (not reEscape) to avoid collision with Lucee built-in.
+    // -----------------------------------------------------------------------
+    function rufReEscape(required string s) {
+        return reReplace(arguments.s, "([.\[\]\\\\^$|?*+(){}])", "\\\\\1", "ALL");
+    }
+
+    // -----------------------------------------------------------------------
     // extractHeader(block, headerName, defaultVal)
     // Extract one RFC 2822-style header value from a text block.
     // \\s becomes \s for the regex engine (whitespace class).
     // -----------------------------------------------------------------------
     function extractHeader(required string block, required string headerName, string defaultVal="") {
-        var pattern = "(?m)^" & reEscape(arguments.headerName) & ":\\s*(.+?)$";
+        var pattern = "(?m)^" & rufReEscape(arguments.headerName) & ":\\s*(.+?)$";
         var m = reFind(pattern, arguments.block, 1, true, "ONE");
         if (m.len[1] GT 0 AND arrayLen(m.len) GT 1)
             return trim(mid(arguments.block, m.pos[2], m.len[2]));
         return arguments.defaultVal;
-    }
-
-    function reEscape(required string s) {
-        return reReplace(arguments.s, "([.\[\]\\\\^$|?*+(){}])", "\\\\\1", "ALL");
     }
 
     // -----------------------------------------------------------------------
@@ -144,7 +149,6 @@
     // -----------------------------------------------------------------------
     if (NOT len(sourceIP)) {
         // C1: extract IP from prose in the text/plain section
-        // Find text/plain part body first
         plainStart = reFindNoCase("Content-Type:[\t ]*text/plain", msgBody);
         if (plainStart GT 0) {
             plainBodyStart = find(chr(10) & chr(10), msgBody, plainStart);
@@ -152,13 +156,10 @@
                 plainBodyStart = find(chr(13) & chr(10) & chr(13) & chr(10), msgBody, plainStart);
             if (plainBodyStart GT 0) {
                 plainBody  = mid(msgBody, plainBodyStart, len(msgBody) - plainBodyStart + 1);
-                // Trim at next MIME boundary
                 plainBound = reFindNoCase("^--", plainBody, 1);
                 if (plainBound GT 1) plainBody = left(plainBody, plainBound - 1);
 
-                // Match IPv4 or IPv6 after "from IP" / "received from" / "IP:"
-                // IPv4: digits and dots; IPv6: hex and colons
-                ipPat  = "(?i)(?:from IP|received from IP|Source IP|IP:)[\t ]+([0-9a-fA-F:.]+)";
+                ipPat   = "(?i)(?:from IP|received from IP|Source IP|IP:)[\t ]+([0-9a-fA-F:.]+)";
                 ipMatch = reFind(ipPat, plainBody, 1, true, "ONE");
                 if (ipMatch.len[1] GT 0 AND arrayLen(ipMatch.len) GT 1)
                     sourceIP = trim(mid(plainBody, ipMatch.pos[2], ipMatch.len[2]));
@@ -168,7 +169,6 @@
 
     if (NOT len(sourceIP)) {
         // C2: parse Received: headers from the original message part
-        // Handles both text/rfc822-headers (163.com) and message/rfc822 (standard)
         origPartStart = reFindNoCase(
             "Content-Type:[\t ]*(text/rfc822-headers|message/rfc822)", msgBody);
         if (origPartStart GT 0) {
@@ -176,18 +176,14 @@
             if (origBodyStart EQ 0)
                 origBodyStart = find(chr(13) & chr(10) & chr(13) & chr(10), msgBody, origPartStart);
             if (origBodyStart GT 0) {
-                origHdrs = mid(msgBody, origBodyStart, len(msgBody) - origBodyStart + 1);
+                origHdrs  = mid(msgBody, origBodyStart, len(msgBody) - origBodyStart + 1);
                 origBound = reFindNoCase("^--", origHdrs, 1);
                 if (origBound GT 1) origHdrs = left(origHdrs, origBound - 1);
 
-                // Extract first Received: line then pull the client IP from it.
-                // Received: from hostname ([ip]) or from [ip]
-                // Avoid 127.x and 10.x and 192.168.x (private/loopback)
-                rcvdPat = "(?i)Received:[\t ]+from[^\n]+\(([0-9a-fA-F:.]+)\)";
+                rcvdPat   = "(?i)Received:[\t ]+from[^\n]+\(([0-9a-fA-F:.]+)\)";
                 rcvdMatch = reFind(rcvdPat, origHdrs, 1, true, "ONE");
                 if (rcvdMatch.len[1] GT 0 AND arrayLen(rcvdMatch.len) GT 1) {
                     candidateIP = trim(mid(origHdrs, rcvdMatch.pos[2], rcvdMatch.len[2]));
-                    // Accept any IP that isn't obviously loopback or private
                     if (NOT reFindNoCase("^(127\.|10\.|192\.168\.|::1$)", candidateIP))
                         sourceIP = candidateIP;
                 }
@@ -226,8 +222,7 @@
     }
 
     // -----------------------------------------------------------------------
-    // Original headers (used for raw_message context; already extracted above
-    // in Format C2 path if applicable)
+    // Original headers for raw_message context
     // -----------------------------------------------------------------------
     if (NOT len(originalHdrs)) {
         origPartStart2 = reFindNoCase(

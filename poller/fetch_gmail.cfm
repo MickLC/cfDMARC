@@ -23,12 +23,15 @@
              "DMARC Forensic Report" or "DMARC Failure Report"
         3. Auto-submitted + DMARC + Report in subject (edge cases)
 
-      Lucee string-literal gotchas:
+      Lucee gotchas:
+        - Nested functions defined inside a cfscript function do NOT close over
+          the outer function's local variables. walkParts() has been replaced
+          with an iterative queue-based approach in extractGmailRufBody() to
+          avoid this scope issue entirely.
         - Do NOT embed literal " inside double-quoted CFML strings passed to
           regex functions. Use chr(34) instead.
         - Do NOT use \s, \r, \n, \t in double-quoted CFML string literals.
-          Use chr() or explicit character classes. \\s (double-backslash)
-          becomes \s in the string value and works correctly for the regex.
+          Use chr() or explicit character classes.
 --->
 <cfscript>
 
@@ -186,11 +189,8 @@
     // isRufContentType(ct)
     //
     // Returns true if ct indicates a standard ARF RUF message.
-    // Matches both quoted and unquoted report-type parameter values:
-    //   multipart/report; report-type=feedback-report
-    //   multipart/report; report-type="feedback-report"
-    //
-    // chr(34) injects a literal " without confusing the CFML lexer.
+    // Matches both quoted and unquoted report-type parameter values.
+    // chr(34) used instead of literal " to avoid Lucee lexer bug.
     // -----------------------------------------------------------------------
     function isRufContentType(required string ct) {
         if (NOT reFindNoCase("multipart/report", arguments.ct)) return false;
@@ -269,65 +269,82 @@
     }
 
     // -----------------------------------------------------------------------
-    // extractGmailRufBody(payload)
+    // extractGmailRufBody(payload, currentGmailMsgId, currentGmailToken)
     //
     // Reassembles MIME body text from a Gmail format=full payload for
     // parse_ruf.cfm. Emits Content-Type header lines so parse_ruf.cfm's
     // regex searches for MIME part boundaries still work.
+    //
+    // Uses an iterative queue rather than a nested walkParts() function.
+    // Lucee nested functions do not close over the outer function's local
+    // variables (sb, gmailToken, gmailMsgId), so nesting caused a
+    // "variable [SB] doesn't exist" runtime error.
     // -----------------------------------------------------------------------
-    function extractGmailRufBody(required struct payload) {
-        var sb = createObject("java", "java.lang.StringBuilder").init();
+    function extractGmailRufBody(
+        required struct payload,
+        required string currentGmailMsgId,
+        required string currentGmailToken
+    ) {
+        var sb         = createObject("java", "java.lang.StringBuilder").init();
+        var partsQueue = [];
 
-        function walkParts(required array parts) {
-            for (var part in arguments.parts) {
-                var mimeType = trim(part.mimeType ?: "");
-
-                if (reFindNoCase("^multipart/", mimeType)) {
-                    if (structKeyExists(part, "parts") AND isArray(part.parts) AND arrayLen(part.parts))
-                        walkParts(part.parts);
-                    continue;
-                }
-
-                // Emit Content-Type header so parse_ruf.cfm's pattern searches work
-                sb.append("Content-Type: " & mimeType & chr(10));
-                sb.append(chr(10));
-
-                var partData = "";
-                if (structKeyExists(part, "body") AND isStruct(part.body)) {
-                    if (structKeyExists(part.body, "data") AND len(part.body.data)) {
-                        try { partData = b64urlDecodeToString(part.body.data); } catch(any e) { partData = ""; }
-                    } else if (structKeyExists(part.body, "attachmentId") AND len(part.body.attachmentId)) {
-                        try {
-                            var attResp = gmailApiGet(gmailToken,
-                                "messages/" & gmailMsgId & "/attachments/" & part.body.attachmentId);
-                            if (structKeyExists(attResp, "data") AND len(attResp.data))
-                                partData = b64urlDecodeToString(attResp.data);
-                        } catch(any e) { partData = ""; }
-                    }
-                }
-                sb.append(partData);
-                sb.append(chr(10) & chr(10));
-            }
+        // Emit top-level Content-Type
+        var topMimeType = trim(arguments.payload.mimeType ?: "");
+        if (len(topMimeType)) {
+            sb.append("Content-Type: " & topMimeType & chr(10));
+            sb.append(chr(10));
         }
 
-        if (structKeyExists(arguments.payload, "parts") AND isArray(arguments.payload.parts) AND arrayLen(arguments.payload.parts)) {
-            // Multipart: emit top-level Content-Type then walk parts
-            var topMimeType = trim(arguments.payload.mimeType ?: "");
-            if (len(topMimeType)) {
-                sb.append("Content-Type: " & topMimeType & chr(10));
-                sb.append(chr(10));
-            }
-            walkParts(arguments.payload.parts);
+        // Seed the queue with the top-level parts array, or handle single-part
+        if (structKeyExists(arguments.payload, "parts")
+                AND isArray(arguments.payload.parts)
+                AND arrayLen(arguments.payload.parts)) {
+            for (var seedPart in arguments.payload.parts)
+                arrayAppend(partsQueue, seedPart);
         } else if (structKeyExists(arguments.payload, "body") AND isStruct(arguments.payload.body)) {
-            // Single-part (e.g. text/plain forensic notification)
-            var topMimeType = trim(arguments.payload.mimeType ?: "");
-            if (len(topMimeType)) {
-                sb.append("Content-Type: " & topMimeType & chr(10));
-                sb.append(chr(10));
-            }
+            // Single-part message: decode body directly, no queue needed
             if (structKeyExists(arguments.payload.body, "data") AND len(arguments.payload.body.data)) {
                 try { sb.append(b64urlDecodeToString(arguments.payload.body.data)); } catch(any e) {}
             }
+            return sb.toString();
+        }
+
+        // Process the queue iteratively (avoids nested function scope issues)
+        var qIdx = 1;
+        while (qIdx LTE arrayLen(partsQueue)) {
+            var part     = partsQueue[qIdx];
+            var mimeType = trim(part.mimeType ?: "");
+            qIdx++;
+
+            // Multipart container: enqueue its children
+            if (reFindNoCase("^multipart/", mimeType)) {
+                if (structKeyExists(part, "parts") AND isArray(part.parts) AND arrayLen(part.parts)) {
+                    for (var childPart in part.parts)
+                        arrayAppend(partsQueue, childPart);
+                }
+                continue;
+            }
+
+            // Leaf part: emit Content-Type header then decode body
+            sb.append("Content-Type: " & mimeType & chr(10));
+            sb.append(chr(10));
+
+            var partData = "";
+            if (structKeyExists(part, "body") AND isStruct(part.body)) {
+                if (structKeyExists(part.body, "data") AND len(part.body.data)) {
+                    try { partData = b64urlDecodeToString(part.body.data); } catch(any e) { partData = ""; }
+                } else if (structKeyExists(part.body, "attachmentId") AND len(part.body.attachmentId)) {
+                    try {
+                        var attResp = gmailApiGet(arguments.currentGmailToken,
+                            "messages/" & arguments.currentGmailMsgId
+                            & "/attachments/" & part.body.attachmentId);
+                        if (structKeyExists(attResp, "data") AND len(attResp.data))
+                            partData = b64urlDecodeToString(attResp.data);
+                    } catch(any e) { partData = ""; }
+                }
+            }
+            sb.append(partData);
+            sb.append(chr(10) & chr(10));
         }
 
         return sb.toString();
@@ -487,14 +504,9 @@
 
                         // -------------------------------------------------------
                         // RUF detection - three signals, any one is sufficient:
-                        //
-                        // 1. Standard ARF Content-Type (quoted or unquoted value):
-                        //    multipart/report; report-type=["']?feedback-report
-                        //
-                        // 2. Plain-text forensic notification subject line:
-                        //    "DMARC Forensic Report" / "DMARC Failure Report"
-                        //
-                        // 3. Auto-Submitted header + DMARC + Report in subject
+                        //   1. Standard ARF Content-Type (quoted or unquoted)
+                        //   2. Subject: DMARC Forensic/Failure Report ...
+                        //   3. Auto-Submitted + DMARC + Report in subject
                         // -------------------------------------------------------
                         isRUF = isRufContentType(contentType);
 
@@ -508,7 +520,9 @@
 
                         if (isRUF) {
 
-                            msgBody = extractGmailRufBody(gmailPayload);
+                            // Pass gmailMsgId and gmailToken explicitly to avoid
+                            // page-scope variable access issues inside the function
+                            msgBody = extractGmailRufBody(gmailPayload, gmailMsgId, gmailToken);
 
                             if (NOT len(trim(msgBody))) {
                                 logLine("  Gmail: RUF msg=#gmailMsgId# has no decodable body - skipping", "WARN");
