@@ -425,9 +425,9 @@
                     msgSubject = qOneHeader.recordCount ? qOneHeader.subject[1] : "";
 
                     rawHdr     = qOneHeader.recordCount ? qOneHeader.header[1] : "";
-                    var midPat2  = "(?i)Message-ID:[ " & chr(9) & "]*([^" & chr(13) & chr(10) & "]+)";
-                    midMatch     = reFind(midPat2, rawHdr, 1, true);
-                    quickMsgId   = "";
+                    midPat2    = "(?i)Message-ID:[ " & chr(9) & "]*([^" & chr(13) & chr(10) & "]+)";
+                    midMatch   = reFind(midPat2, rawHdr, 1, true);
+                    quickMsgId = "";
                     if (midMatch.len[1] GT 0 AND arrayLen(midMatch.len) GT 1)
                         quickMsgId = reReplace(trim(mid(rawHdr, midMatch.pos[2], midMatch.len[2])),
                                                "[<> " & chr(9) & chr(13) & chr(10) & "]+", "", "ALL");
