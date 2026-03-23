@@ -34,8 +34,3 @@ A ColdFusion/Lucee DMARC reporting dashboard for self-hosted infrastructure.
 - Generate pepper and encryption key with `openssl rand -base64 32`
 - Set `DMARC_PEPPER` as an environment variable rather than in settings.cfm
 - Delete `admin/setup.cfm` immediately after creating your admin account
-
-## Legacy
-
-The `legacy/` directory contains the original 2016 shell-script-based pipeline
-(procmail → munpack → ColdFusion XML processor). Preserved for reference only.
