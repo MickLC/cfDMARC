@@ -1,5 +1,0 @@
-LOGFILE=/home/fetch/.procmail.log 
-MAILDIR=/home/fetch/ 
-VERBOSE=on
-:0
-Maildir/
