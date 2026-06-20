@@ -167,11 +167,19 @@
         }
 
         function getBoundary(required string ctValue) {
-            var pat = "(?i)boundary=([^'" & chr(34) & "; " & chr(9) & ",]+)";
+            // Boundary values are usually double-quoted per RFC 2046
+            // (Python/PHP mailers: boundary="===...=="), occasionally
+            // single-quoted, occasionally a bare token. Try each form;
+            // a bare [^...]+ class can never match when the value starts
+            // with the very quote char it's told to exclude.
+            var q   = chr(34);
+            var pat = "(?i)boundary\s*=\s*(?:" & q & "([^" & q & "]*)" & q
+                    & "|'([^']*)'"
+                    & "|([^;," & chr(9) & " ]+))";
             var m   = reFind(pat, arguments.ctValue, 1, true);
-            if (m.len[1] GT 0 AND arrayLen(m.len) GT 1) {
-                var val = mid(arguments.ctValue, m.pos[2], m.len[2]);
-                return reReplace(val, "^'|'$", "", "ALL");
+            if (m.len[1] EQ 0) return "";
+            for (var i = 2; i LTE arrayLen(m.len); i++) {
+                if (m.len[i] GT 0) return mid(arguments.ctValue, m.pos[i], m.len[i]);
             }
             return "";
         }

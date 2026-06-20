@@ -9,7 +9,43 @@
 
     <cffunction name="onApplicationStart" returntype="boolean" output="false">
         <cfinclude template="/config/settings.cfm">
+        <cfset registerPoller()>
         <cfreturn true>
+    </cffunction>
+
+    <!---
+        Registers (or re-registers) the DMARC poller as a Lucee scheduled
+        task. action="update" is idempotent -- safe to call on every app
+        start/reload, it just resyncs the existing task definition.
+        Uses application.baseURL (not 127.0.0.1) so Apache/mod_cfml routes
+        the request to the correct vhost/web context on Harry.
+    --->
+    <cffunction name="registerPoller" returntype="void" output="false">
+        <cfscript>
+            if (NOT structKeyExists(application, "poller")
+                OR NOT structKeyExists(application.poller, "intervalMinutes")
+                OR application.poller.intervalMinutes LTE 0) {
+                return;
+            }
+
+            try {
+                cfschedule(
+                    action         = "update",
+                    task           = "cfDMARC_poller",
+                    operation      = "HTTPRequest",
+                    url            = application.baseURL & "/poller/poll.cfm?token=" & urlEncodedFormat(application.poller.token),
+                    startDate      = dateFormat(now(), "mm/dd/yyyy"),
+                    startTime      = timeFormat(now(), "HH:mm:ss"),
+                    interval       = application.poller.intervalMinutes * 60,
+                    requestTimeOut = 280,
+                    resolveURL     = false,
+                    publish        = false
+                );
+            } catch (any e) {
+                cflog(file="dmarc_errors", type="error",
+                      text="registerPoller: failed to register cfschedule task: " & e.message);
+            }
+        </cfscript>
     </cffunction>
 
     <cffunction name="onSessionStart" returntype="void" output="false">
