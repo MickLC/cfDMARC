@@ -385,7 +385,7 @@
         try {
 
             if (acct.auth_type EQ "oauth2") {
-                include "/poller/fetch_gmail.cfm";
+                include "/pollerlib/fetch_gmail.cfm";
                 continue;
             }
 
@@ -488,7 +488,7 @@
 
                     if (isRUF) {
                         logLine("  uid=#msgUID# -> RUF");
-                        include "/poller/parse_ruf.cfm";
+                        include "/pollerlib/parse_ruf.cfm";
                     } else {
                         try {
                             rawBytes = extractDmarcAttachment(fetched.body, fetched.headers);
@@ -505,7 +505,7 @@
                             continue;
                         }
                         logLine("  uid=#msgUID# -> RUA");
-                        include "/poller/parse_rua.cfm";
+                        include "/pollerlib/parse_rua.cfm";
                     }
 
                     disposeMessage(acct.username, mailbox, msgUID);

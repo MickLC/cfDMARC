@@ -7,6 +7,14 @@
     <cfset this.scriptProtect     = "all">
     <cfset this.datasource        = "dmarc">
 
+    <!--- Only public/ is web-served. Everything else lives one level up and
+          is reached through these mappings, so it can never be requested
+          directly. --->
+    <cfset variables.appRoot = getDirectoryFromPath(getCurrentTemplatePath()) & "../">
+    <cfset this.mappings["/config"]     = variables.appRoot & "config">
+    <cfset this.mappings["/includes"]   = variables.appRoot & "includes">
+    <cfset this.mappings["/pollerlib"]  = variables.appRoot & "src/poller">
+
     <cffunction name="onApplicationStart" returntype="boolean" output="false">
         <cfinclude template="/config/settings.cfm">
         <cfset registerPoller()>

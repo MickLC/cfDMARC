@@ -1,0 +1,8 @@
+[cfdmarc-login]
+enabled  = true
+port     = http,https
+filter   = cfdmarc-login
+logpath  = /var/log/apache2/*access.log
+maxretry = 5
+findtime = 10m
+bantime  = 1h
