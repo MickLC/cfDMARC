@@ -117,6 +117,38 @@ function auditLog(
 }
 
 // ----------------------------------------------------------------
+// CSRF protection (synchronizer token stored in the session)
+// ----------------------------------------------------------------
+
+function csrfToken() {
+    if (NOT structKeyExists(session, "csrfToken") OR NOT len(session.csrfToken)) {
+        session.csrfToken = generateToken(48);
+    }
+    return session.csrfToken;
+}
+
+function csrfField() {
+    return '<input type="hidden" name="csrf_token" value="' & htmlEditFormat(csrfToken()) & '">';
+}
+
+// Call at the top of any POST handler. Aborts with 403 on a missing or wrong token.
+function requireCsrf() {
+    var supplied = structKeyExists(form, "csrf_token") ? form.csrf_token : "";
+    var ok = false;
+    if (len(supplied) AND structKeyExists(session, "csrfToken") AND len(session.csrfToken)) {
+        ok = createObject("java", "java.security.MessageDigest").isEqual(
+            supplied.getBytes("UTF-8"),
+            session.csrfToken.getBytes("UTF-8")
+        );
+    }
+    if (NOT ok) {
+        cfheader(statusCode=403, statusText="Forbidden");
+        writeOutput("Invalid or missing CSRF token. Reload the page and try again.");
+        cfabort();
+    }
+}
+
+// ----------------------------------------------------------------
 // IP address helpers
 // ----------------------------------------------------------------
 

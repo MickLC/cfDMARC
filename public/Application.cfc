@@ -5,6 +5,9 @@
     <cfset this.sessionManagement = true>
     <cfset this.sessionTimeout    = createTimeSpan(0, 8, 0, 0)>
     <cfset this.scriptProtect     = "all">
+    <!--- Session cookie: not readable by JS, HTTPS only, not sent on cross-site
+          POSTs. secure=true means the admin UI must be served over HTTPS. --->
+    <cfset this.sessionCookie     = { httpOnly: true, secure: true, sameSite: "lax" }>
     <cfset this.datasource        = "dmarc">
 
     <!--- Only public/ is web-served. Everything else lives one level up and

@@ -5,15 +5,18 @@
 <cfinclude template="/includes/functions.cfm">
 
 <cfscript>
-    param name="url.action" default="";
+    param name="form.action" default="";
     pageMessage      = "";
     pageMessageClass = "alert-info";
     pollErrorBody    = "";
 
-    if (url.action EQ "run") {
+    if (cgi.request_method EQ "POST" AND form.action EQ "run") {
+        requireCsrf();
         try {
-            pollURL = application.baseURL & "/poller/poll.cfm?token=" & urlEncodedFormat(application.poller.token);
-            cfhttp(url=pollURL, method="GET", timeout=300, result="pollResult");
+            pollURL = application.baseURL & "/poller/poll.cfm";
+            cfhttp(url=pollURL, method="GET", timeout=300, result="pollResult") {
+                cfhttpparam(type="header", name="X-Poller-Token", value=application.poller.token);
+            }
             httpStatus = pollResult.responseHeader["Status_Code"] ?: "?";
             if (find("OK:", pollResult.fileContent)) {
                 pageMessage      = "Poll complete: #htmlEditFormat(trim(pollResult.fileContent))#";
@@ -69,9 +72,12 @@
 </cfif>
 
 <div class="d-flex gap-2 mb-4">
-    <a href="?action=run" class="btn btn-primary"
-       onclick="return confirm('Run the poller now?')"
-    ><i class="bi bi-arrow-repeat"></i> Run Now</a>
+    <form method="post" action="/admin/poller.cfm" class="m-0"
+          onsubmit="return confirm('Run the poller now?')">
+        #csrfField()#
+        <input type="hidden" name="action" value="run">
+        <button type="submit" class="btn btn-primary"><i class="bi bi-arrow-repeat"></i> Run Now</button>
+    </form>
     <a href="/admin/accounts.cfm" class="btn btn-outline-secondary"><i class="bi bi-envelope-at"></i> Manage Accounts</a>
 </div>
 

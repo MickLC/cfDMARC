@@ -24,6 +24,7 @@
     pageError   = "";
 
     if (cgi.request_method EQ "POST") {
+        requireCsrf();
 
         param name="form.label"               default="";
         param name="form.host"                default="";
@@ -254,6 +255,7 @@
                 </td>
                 <td style="white-space:nowrap;">
                     <form method="post" action="/admin/accounts.cfm" style="display:inline">
+                    #csrfField()#
                     <input type="hidden" name="acct_id" value="#qAccounts.id#">
                     <input type="hidden" name="action" value="toggle">
                     <button type="submit" class="btn btn-sm #(qAccounts.active ? 'btn-success' : 'btn-outline-secondary')#">
@@ -270,6 +272,7 @@
                     &nbsp;
                     <form method="post" action="/admin/accounts.cfm" style="display:inline"
                           onsubmit="return confirm('Delete this account?')">
+                    #csrfField()#
                     <input type="hidden" name="acct_id" value="#qAccounts.id#">
                     <input type="hidden" name="action"  value="delete">
                     <button type="submit" class="btn btn-sm btn-danger"><i class="bi bi-trash"></i></button>
@@ -288,6 +291,7 @@
     <div class="card-header">#(url.action EQ 'edit' ? 'Edit' : 'Add')# Account</div>
     <div class="card-body">
     <form method="post" action="/admin/accounts.cfm">
+    #csrfField()#
     <input type="hidden" name="action"  value="save">
     <input type="hidden" name="acct_id" value="#(structKeyExists(editAcct,'id') ? editAcct.id : 0)#">
 
