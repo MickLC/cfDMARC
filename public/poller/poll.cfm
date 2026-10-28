@@ -56,12 +56,38 @@
 
 <cfscript>
     param name="url.token" default="";
-    if (NOT structKeyExists(application, "poller")
-        OR NOT structKeyExists(application.poller, "token")
-        OR url.token NEQ application.poller.token
-        OR NOT len(url.token)) {
+
+    // Prefer the X-Poller-Token header (keeps the secret out of access logs);
+    // ?token= is still accepted so existing cfschedule tasks keep working.
+    suppliedToken = url.token;
+    reqHeaders    = getHttpRequestData().headers;
+    if (structKeyExists(reqHeaders, "X-Poller-Token") AND len(reqHeaders["X-Poller-Token"]))
+        suppliedToken = reqHeaders["X-Poller-Token"];
+
+    tokenOk = false;
+    if (structKeyExists(application, "poller")
+        AND structKeyExists(application.poller, "token")
+        AND len(application.poller.token)
+        AND len(suppliedToken)) {
+        // Constant-time compare so response timing does not leak the token.
+        tokenOk = createObject("java", "java.security.MessageDigest").isEqual(
+            suppliedToken.getBytes("UTF-8"),
+            application.poller.token.getBytes("UTF-8")
+        );
+    }
+    if (NOT tokenOk) {
         cfheader(statusCode=403, statusText="Forbidden");
         cfabort();
+    }
+
+    // Values interpolated into doveadm argument strings must not contain
+    // whitespace, quotes or a leading "-" (option injection). Usernames come
+    // from the admin Accounts form; UIDs from doveadm output.
+    function isSafeUsername(required string v) {
+        return reFind("^[A-Za-z0-9._][A-Za-z0-9._@+-]{0,254}$", arguments.v) GT 0;
+    }
+    function isSafeMailbox(required string v) {
+        return reFind("^[A-Za-z0-9._][A-Za-z0-9._/-]{0,254}$", arguments.v) GT 0;
     }
 
     pollStart  = now();
@@ -102,7 +128,7 @@
         }
         if (structKeyExists(application.poller, "deleteAfter") AND application.poller.deleteAfter) {
             try {
-                cfimap(action="delete", connection=arguments.connection,
+                cfimap(action="delete", connection="poll_#acct.id#",
                        folder=arguments.mailbox, uid=arguments.uid);
             } catch(any e) {}
         }
@@ -130,7 +156,7 @@
             line = trim(reReplace(line, chr(13), "", "ALL"));
             if (NOT len(line)) continue;
             var tokens = listToArray(line, " ");
-            if (arrayLen(tokens) GTE 2) arrayAppend(uids, tokens[2]);
+            if (arrayLen(tokens) GTE 2 AND reFind("^[0-9]+$", tokens[2])) arrayAppend(uids, tokens[2]);
             if (arrayLen(uids) GTE arguments.maxCount) break;
         }
         return uids;
@@ -390,6 +416,12 @@
             }
 
             mailbox = len(trim(acct.mailbox)) ? trim(acct.mailbox) : "INBOX";
+
+            if (NOT isSafeUsername(acct.username) OR NOT isSafeMailbox(mailbox)) {
+                logLine("  Skipping account #acct.id#: username or mailbox contains unsafe characters", "ERROR");
+                totalError++;
+                continue;
+            }
 
             unseenUids = getUnseenUids(acct.username, mailbox, application.poller.batchSize);
             msgCount   = arrayLen(unseenUids);

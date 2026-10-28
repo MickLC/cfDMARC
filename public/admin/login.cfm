@@ -5,7 +5,12 @@
 <cfparam name="form.password" default="">
 
 <cfset variables.error = "">
+<!--- Only allow same-site relative redirects: a single leading "/" and no
+      "//" or "/\" (protocol-relative), scheme, or control characters. --->
 <cfset variables.redir = url.redir>
+<cfif NOT reFind("^/[^/\\]", variables.redir) OR reFind("[[:cntrl:]]", variables.redir)>
+    <cfset variables.redir = "/admin/dashboard.cfm">
+</cfif>
 
 <cfif structKeyExists(session, "loggedIn") AND session.loggedIn>
     <cflocation url="#variables.redir#" addtoken="false">
@@ -14,14 +19,22 @@
 
 <cfif CGI.REQUEST_METHOD EQ "POST" AND len(trim(form.username)) AND len(trim(form.password))>
     <cfscript>
+        // Fixed dummy hash so unknown/inactive users cost the same PBKDF2 work
+        // as real ones (prevents username enumeration by response time).
+        _dummyHash = "50000:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         _user = queryExecute(
             "SELECT id, username, password_hash, active FROM users WHERE username = ? LIMIT 1",
             [ trim(form.username) ],
             { datasource: application.db.dsn }
         );
 
-        if (_user.recordCount EQ 1 AND _user.active EQ 1
-            AND verifyPassword(trim(form.password), _user.password_hash)) {
+        _userOk   = (_user.recordCount EQ 1 AND _user.active EQ 1);
+        _passOk   = verifyPassword(trim(form.password), _userOk ? _user.password_hash : _dummyHash);
+
+        if (_userOk AND _passOk) {
+
+            // Issue a fresh session ID so a pre-login session cookie cannot be reused.
+            sessionRotate();
 
             _token = generateToken(64);
             queryExecute(
@@ -42,7 +55,7 @@
             location(url=variables.redir, addtoken=false);
             abort;
         } else {
-            sleep(1200);
+            sleep(500);
             variables.error = "Invalid username or password.";
             auditLog(action="login_failed", detail="Failed login for: #htmlEditFormat(form.username)#", userId=0);
         }

@@ -44,6 +44,12 @@
 
             if (NOT len(trim(form.label)) OR NOT len(trim(form.host)) OR NOT len(trim(form.username))) {
                 pageError = "Label, host, and username are required.";
+            } else if (form.auth_type EQ "password"
+                       AND (NOT reFind("^[A-Za-z0-9._][A-Za-z0-9._@+-]{0,254}$", trim(form.username))
+                            OR (len(trim(form.mailbox))
+                                AND NOT reFind("^[A-Za-z0-9._][A-Za-z0-9._/-]{0,254}$", trim(form.mailbox))))) {
+                // These values reach doveadm on the command line (poller).
+                pageError = "Username may only contain letters, digits and . _ @ + - ; mailbox only letters, digits and . _ / - (no spaces).";
             } else {
 
                 // Encrypt sensitive values only when a new value was supplied.

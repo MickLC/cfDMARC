@@ -30,6 +30,7 @@ function verifyPassword(required string plaintext, required string storedHash) {
                  ? application.pepper
                  : environmentGet("DMARC_PEPPER", "");
     var parts      = listToArray(arguments.storedHash, ":");
+    if (arrayLen(parts) LT 3) return false;
     var iterations = val(parts[1]);
     var salt       = parts[2];
     var expected   = parts[3];
